@@ -24,6 +24,16 @@ final class OSCARClient: ObservableObject {
     @Published private(set) var state: State = .disconnected
     @Published private(set) var incomingMessages: [IncomingIM] = []
 
+    /// Your synced buddy list, reconciled from feedbag + live presence updates.
+    /// See Feedbag.swift for how this gets populated.
+    @Published var buddies: [Buddy] = []
+
+    /// Raw feedbag items as last synced from the server — buddies, groups, and
+    /// meta-items. `buddies` above is the UI-friendly projection of this;
+    /// this raw form is kept around because add/remove operations need to look
+    /// up existing group IDs and item IDs.
+    var feedbagItems: [FeedbagItem] = []
+
     struct IncomingIM: Identifiable {
         let id = UUID()
         let from: String
@@ -31,7 +41,7 @@ final class OSCARClient: ObservableObject {
     }
 
     private var authConnection: FLAPConnection?
-    private var bosConnection: FLAPConnection?
+    var bosConnection: FLAPConnection?
 
     private let host: String
     private let authPort: UInt16
@@ -209,6 +219,9 @@ final class OSCARClient: ObservableObject {
             // before doing anything else; skipping that is fine against a permissive
             // self-hosted server but add it if you hit rate-limit disconnects.
             state = .online
+            // Roster is foundational session state — fetch it as soon as we're online,
+            // same as real clients do before anything else becomes meaningful.
+            requestBuddyList()
 
         case (SNACFamily.messaging.rawValue, 0x07):
             // Incoming IM (ICBM "channel message"). Parsing the nested TLV/fragment
@@ -217,6 +230,12 @@ final class OSCARClient: ObservableObject {
             if let im = Self.parseIncomingIM(snac.body) {
                 incomingMessages.append(im)
             }
+
+        case (SNACFamily.feedbag.rawValue, _):
+            handleFeedbagFrame(snac)
+
+        case (SNACFamily.buddyPresence.rawValue, _):
+            handlePresenceFrame(snac)
 
         default:
             break
@@ -250,8 +269,19 @@ final class OSCARClient: ObservableObject {
     // MARK: - Helpers
 
     private var requestIDCounter: UInt32 = 0
-    private func nextRequestID() -> UInt32 {
+    func nextRequestID() -> UInt32 {
         requestIDCounter &+= 1
         return requestIDCounter
+    }
+
+    // Feedbag item IDs are scoped per-account, chosen by the client, and must
+    // not collide with existing items. A monotonic counter seeded above any
+    // ID we've seen from the server is good enough for a v0.1 — a real app
+    // should persist the high-water mark rather than restart from 1 each launch.
+    private var feedbagItemIDCounter: UInt16 = 1
+    func nextFeedbagItemID() -> UInt16 {
+        let existingMax = feedbagItems.map(\.itemID).max() ?? 0
+        feedbagItemIDCounter = max(feedbagItemIDCounter, existingMax) &+ 1
+        return feedbagItemIDCounter
     }
 }

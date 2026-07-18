@@ -44,8 +44,9 @@ struct SNACHeader {
 /// add them here as you build those features out.
 enum SNACFamily: UInt16 {
     case generic = 0x0001        // service-level: rate limits, host online/offline
-    case buddyList = 0x0003
+    case buddyPresence = 0x0003  // "Buddy" family — online/offline arrival notifications
     case messaging = 0x0004      // ICBM — instant messages
+    case feedbag = 0x0013        // buddy list roster storage (add/remove/sync)
     case authorization = 0x0017  // BUCP — login/auth
 }
 

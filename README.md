@@ -75,3 +75,25 @@ Get `login()` reaching `.online` state against your real server, then get
 one IM sent and echoed back in a second client (Pidgin is the easiest ground
 truth). Everything else — buddy list, retro UI chrome, away messages — is
 much easier to add once that loop is proven out.
+
+## Update: buddy list (Feedbag.swift)
+
+Added the roster layer on top of the login/messaging scaffold:
+
+- **Fetching**: `requestBuddyList()` is called automatically once `state` hits
+  `.online`, mirroring what real clients do — roster comes down before
+  anything else is treated as ready.
+- **`buddies`** (published) is the UI-friendly view — screen name, group,
+  online status. **`feedbagItems`** is the raw synced roster, kept around so
+  add/remove can look up existing group/item IDs without re-fetching.
+- **Presence** (family 0x03, arrival/departure) is handled separately from
+  the roster itself — two different SNAC families cooperating to produce one
+  buddy list UI.
+- `addBuddy(screenName:toGroup:)` creates the group on the fly if it doesn't
+  exist yet, then inserts the buddy — two feedbag inserts under the hood.
+
+**Same caveat as everything else here**: the FEEDBAG_REPLY body layout
+(version byte + item count + items + trailing timestamp) is written from
+protocol documentation, not verified against live traffic. If your buddy
+list comes back empty or garbled after `requestBuddyList()`, this is the
+first place to check with a Wireshark capture of Pidgin's own feedbag sync.

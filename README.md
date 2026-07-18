@@ -97,3 +97,25 @@ Added the roster layer on top of the login/messaging scaffold:
 protocol documentation, not verified against live traffic. If your buddy
 list comes back empty or garbled after `requestBuddyList()`, this is the
 first place to check with a Wireshark capture of Pidgin's own feedbag sync.
+
+## Update: away messages (AwayStatus.swift)
+
+Added the Locate family (0x02) — profiles and away messages share this SNAC
+family, since they're really the same "info about a user" mechanism at the
+protocol level.
+
+- **`setAwayMessage(_:)`** — the *only* away mechanism in OSCAR. Passing text
+  sets it; passing `nil` sends an empty TLV, which is how you come back.
+  There's no separate away/available toggle command.
+- **`requestUserInfo(for:)`** — asks the server for a buddy's current away
+  text. Reply lands async and updates `Buddy.awayMessage` in place.
+- **`Buddy.isAway`** — this one's free: the presence arrival notification
+  (family 0x03) carries a status-flags TLV with an away bit, so you know
+  *whether* someone's away immediately on their arrival, with no extra
+  round-trip. The away message *text* is separate and requires the explicit
+  query above — OSCAR pushes the flag proactively but not the text.
+
+**Caveat, same as ever**: the exact TLV number carrying user-status flags in
+the arrival payload (0x0C here) and the away-bit position (0x0020) are
+written from cross-client convention, not verified against a live capture.
+If `isAway` doesn't flip when you'd expect, this is the spot to check first.

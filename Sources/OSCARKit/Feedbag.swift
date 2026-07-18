@@ -99,6 +99,13 @@ struct Buddy: Identifiable, Hashable {
     let screenName: String
     let groupName: String
     var isOnline: Bool = false
+    /// Derived from the status-flags TLV in presence arrival notifications —
+    /// tells you *whether* they're away immediately, without a round-trip.
+    /// The away message *text* is separate (see `awayMessage`) and requires
+    /// an explicit `requestUserInfo(for:)` call, since OSCAR doesn't push
+    /// the actual text proactively, only the flag.
+    var isAway: Bool = false
+    var awayMessage: String? = nil
 }
 
 extension OSCARClient {
@@ -158,10 +165,18 @@ extension OSCARClient {
     /// Family 0x03 (Buddy) — presence notifications, separate from the roster itself.
     func handlePresenceFrame(_ snac: SNAC) {
         switch snac.header.subtype {
-        case 0x0B: // buddy arrived (online)
-            if let name = Self.parseScreenNameBUF(snac.body) {
-                setOnline(true, for: name)
-            }
+        case 0x0B: // buddy arrived (online) — body also carries their current status flags
+            guard let (name, remainder) = Self.parseScreenNameBUFWithRemainder(snac.body) else { return }
+            let tlvs = TLV.parseAll(remainder)
+            // User status flags, TLV 0x0C in most implementations' arrival payload.
+            // Bit 0x0020 is the conventional "away" flag across OSCAR clients.
+            let isAway = tlvs[0x0C].map { data -> Bool in
+                guard data.count >= 2 else { return false }
+                let flags = UInt16(data[data.startIndex]) << 8 | UInt16(data[data.startIndex + 1])
+                return flags & 0x0020 != 0
+            } ?? false
+            setOnline(true, for: name)
+            setAway(isAway, for: name)
         case 0x0C: // buddy departed (offline)
             if let name = Self.parseScreenNameBUF(snac.body) {
                 setOnline(false, for: name)
@@ -208,6 +223,16 @@ extension OSCARClient {
     private func setOnline(_ online: Bool, for screenName: String) {
         guard let index = buddies.firstIndex(where: { $0.screenName == screenName }) else { return }
         buddies[index].isOnline = online
+        if !online {
+            // Away status is meaningless once offline — reset so stale state
+            // doesn't linger and confuse the UI on their next arrival.
+            buddies[index].isAway = false
+        }
+    }
+
+    private func setAway(_ away: Bool, for screenName: String) {
+        guard let index = buddies.firstIndex(where: { $0.screenName == screenName }) else { return }
+        buddies[index].isAway = away
     }
 
     private static func parseScreenNameBUF(_ body: Data) -> String? {
@@ -217,6 +242,18 @@ extension OSCARClient {
         let length = Int(first)
         guard body.count >= 1 + length else { return nil }
         return String(data: body.dropFirst().prefix(length), encoding: .utf8)
+    }
+
+    /// Same as above, but also returns whatever bytes follow the name — the
+    /// arrival notification's TLV block, which callers may want to inspect
+    /// for status flags, warning level, etc.
+    private static func parseScreenNameBUFWithRemainder(_ body: Data) -> (name: String, remainder: Data)? {
+        guard let first = body.first else { return nil }
+        let length = Int(first)
+        guard body.count >= 1 + length else { return nil }
+        guard let name = String(data: body.dropFirst().prefix(length), encoding: .utf8) else { return nil }
+        let remainder = Data(body.dropFirst(1 + length))
+        return (name, remainder)
     }
 
     private func groupID(for name: String) -> UInt16 {

@@ -28,6 +28,11 @@ final class OSCARClient: ObservableObject {
     /// See Feedbag.swift for how this gets populated.
     @Published var buddies: [Buddy] = []
 
+    /// Your own current away message. `nil` means available. See AwayStatus.swift —
+    /// setting this via `setAwayMessage(_:)` is the actual mechanism that makes
+    /// you appear away to buddies; there's no separate away/available toggle in OSCAR.
+    @Published var awayMessage: String?
+
     /// Raw feedbag items as last synced from the server — buddies, groups, and
     /// meta-items. `buddies` above is the UI-friendly projection of this;
     /// this raw form is kept around because add/remove operations need to look
@@ -236,6 +241,9 @@ final class OSCARClient: ObservableObject {
 
         case (SNACFamily.buddyPresence.rawValue, _):
             handlePresenceFrame(snac)
+
+        case (SNACFamily.locate.rawValue, _):
+            handleLocateFrame(snac)
 
         default:
             break

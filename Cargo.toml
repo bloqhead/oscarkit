@@ -11,3 +11,4 @@ path = "src/lib.rs"
 tokio = { version = "1", features = ["full"] }
 md5 = "0.7"
 thiserror = "1"
+rand = "0.8"

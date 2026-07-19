@@ -8,7 +8,9 @@
 //! hasn't changed, only who's running it.
 
 use crate::connection::FlapConnection;
+use crate::feedbag::{Buddy, FeedbagItem};
 use crate::flap::FlapChannel;
+use crate::messaging::IncomingIm;
 use crate::server_address::ServerAddress;
 use crate::snac::{Snac, SnacFamily, SnacHeader, Tlv};
 
@@ -24,12 +26,33 @@ pub enum OscarError {
     LoginFailed(String),
 }
 
-/// An authenticated session, holding the live BOS connection. Messaging,
-/// buddy list, and away-status calls (not yet ported from the Swift
-/// scaffold) will be methods on this once they land.
+/// An authenticated session, holding the live BOS connection plus the state
+/// ported from the Swift scaffold: the synced buddy list (`feedbag.rs`),
+/// your own away message and buddies' (`locate.rs`), and received instant
+/// messages (`messaging.rs`). Call `handle_next_frame` in a loop to keep
+/// this state current as the server pushes updates.
 pub struct OscarSession {
     pub bos_connection: FlapConnection,
     pub screen_name: String,
+
+    /// Your synced buddy list, reconciled from feedbag + live presence
+    /// updates. See `feedbag.rs` for how this gets populated.
+    pub buddies: Vec<Buddy>,
+    /// Raw feedbag items as last synced from the server — buddies, groups,
+    /// and meta-items. `buddies` above is the UI-friendly projection of
+    /// this; this raw form is kept around because add/remove operations
+    /// need to look up existing group IDs and item IDs.
+    pub feedbag_items: Vec<FeedbagItem>,
+    /// Your own current away message. `None` means available. See
+    /// `locate.rs` — setting this via `set_away_message` is the actual
+    /// mechanism that makes you appear away to buddies; there's no separate
+    /// away/available toggle in OSCAR.
+    pub away_message: Option<String>,
+    /// Instant messages received so far, in arrival order.
+    pub incoming_messages: Vec<IncomingIm>,
+
+    ids: RequestIdCounter,
+    feedbag_item_id_counter: u16,
 }
 
 /// The *only* password hashing OSCAR uses: a chained MD5 combining the
@@ -48,14 +71,57 @@ fn roast_password(auth_key: &[u8], password: &str) -> [u8; 16] {
 
 /// Simple monotonic counter for SNAC request IDs. The client picks these;
 /// the server echoes them back, useful for matching responses to requests
-/// once there's more than one in flight at a time (not needed yet for the
-/// strictly sequential login flow, but the connection/messaging layer will
-/// want it).
-struct RequestIdCounter(u32);
+/// once there's more than one in flight at a time — used throughout the
+/// feedbag/locate/messaging methods on `OscarSession`.
+pub(crate) struct RequestIdCounter(u32);
 impl RequestIdCounter {
-    fn next(&mut self) -> u32 {
+    pub(crate) fn next(&mut self) -> u32 {
         self.0 = self.0.wrapping_add(1);
         self.0
+    }
+}
+
+impl OscarSession {
+    pub(crate) fn next_request_id(&mut self) -> u32 {
+        self.ids.next()
+    }
+
+    /// Feedbag item IDs are scoped per-account, chosen by the client, and
+    /// must not collide with existing items. A monotonic counter seeded
+    /// above any ID we've seen from the server is good enough for a v0.1 —
+    /// a real app should persist the high-water mark rather than restart
+    /// from 1 each launch.
+    pub(crate) fn next_feedbag_item_id(&mut self) -> u16 {
+        let existing_max = self.feedbag_items.iter().map(|i| i.item_id).max().unwrap_or(0);
+        self.feedbag_item_id_counter = self.feedbag_item_id_counter.max(existing_max).wrapping_add(1);
+        self.feedbag_item_id_counter
+    }
+
+    /// Reads one FLAP frame from the BOS connection and, if it carries a
+    /// SNAC this client understands, dispatches it to the matching
+    /// handler — updating `buddies`, `incoming_messages`, `away_message`,
+    /// etc. in place. Call this in a loop once logged in to keep session
+    /// state current; this is also the natural place for a future Tauri
+    /// layer to poll from and re-emit as frontend events.
+    pub async fn handle_next_frame(&mut self) -> Result<(), OscarError> {
+        let frame = self.bos_connection.read_frame().await?.ok_or(OscarError::ConnectionClosed("bos session"))?;
+        if frame.channel != FlapChannel::Data {
+            return Ok(());
+        }
+        let Some(snac) = Snac::parse(&frame.payload) else { return Ok(()) };
+
+        match SnacFamily::from_u16(snac.header.family) {
+            Some(SnacFamily::Messaging) if snac.header.subtype == crate::messaging::INCOMING_IM => {
+                if let Some(im) = crate::messaging::parse_incoming_im(&snac.body) {
+                    self.incoming_messages.push(im);
+                }
+            }
+            Some(SnacFamily::Feedbag) => self.handle_feedbag_frame(&snac).await?,
+            Some(SnacFamily::BuddyPresence) => self.handle_presence_frame(&snac),
+            Some(SnacFamily::Locate) => self.handle_locate_frame(&snac),
+            _ => {}
+        }
+        Ok(())
     }
 }
 
@@ -176,7 +242,23 @@ pub async fn login(server: &ServerAddress, screen_name: &str, password: &str) ->
         }
     }
 
-    Ok(OscarSession { bos_connection: bos, screen_name: screen_name.to_string() })
+    let mut session = OscarSession {
+        bos_connection: bos,
+        screen_name: screen_name.to_string(),
+        buddies: Vec::new(),
+        feedbag_items: Vec::new(),
+        away_message: None,
+        incoming_messages: Vec::new(),
+        ids: RequestIdCounter(0),
+        feedbag_item_id_counter: 1,
+    };
+
+    // Roster is foundational session state — fetch it as soon as we're
+    // online, same as real clients do before anything else becomes
+    // meaningful. The reply arrives async; consume it via `handle_next_frame`.
+    session.request_buddy_list().await?;
+
+    Ok(session)
 }
 
 #[cfg(test)]

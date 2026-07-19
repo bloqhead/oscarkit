@@ -97,7 +97,48 @@ passes clean with no warnings.
 
 ### Not yet ported
 
-Messaging, buddy list (feedbag), away status — all existed in the Swift
-scaffold and are straightforward ports now that `OscarSession` exists to
-hang them off of. Also still pending: the actual Tauri shell (`invoke`
-commands, event emission) and the Vue frontend.
+The actual Tauri shell (`invoke` commands, event emission) and the Vue
+frontend — everything else from the Swift scaffold has landed, see below.
+
+## Update: feedbag, presence, away status, and messaging ported to Rust (feedbag.rs, locate.rs, messaging.rs)
+
+Ports the three Swift files that existed on top of the login scaffold —
+`Feedbag.swift`, `AwayStatus.swift`, and the messaging bits of
+`OSCARClient.swift` — onto `OscarSession`. `login()` now calls
+`request_buddy_list()` automatically once BOS comes online, matching what
+real clients do before anything else becomes meaningful.
+
+- **`src/feedbag.rs`** — `FeedbagItem` (encode/parse for the buddy-list wire
+  format) and `Buddy` (the UI-friendly projection: online/away state plus
+  group membership). `OscarSession::request_buddy_list`, `add_buddy`,
+  `remove_buddy`; frame handlers for the feedbag reply/ack cycle and the
+  Buddy-family (0x03) presence arrivals/departures.
+- **`src/locate.rs`** — away status rides the Locate family (0x02), same
+  quirk as the Swift version: there's no dedicated "go away"/"come back"
+  command, setting a non-empty away message *is* going away.
+  `set_away_message`, `request_user_info`, and the reply handler that
+  updates a buddy's `away_message` in place.
+- **`src/messaging.rs`** — `send_message` builds the ICBM send-IM SNAC
+  (cookie, channel, recipient BUF, nested message TLV); `IncomingIm` plus
+  the parser for the mirror-image incoming structure.
+- **`OscarSession::handle_next_frame`** (in `client.rs`) — the dispatch loop
+  tying it together: reads one FLAP frame off BOS, routes it by SNAC family
+  to the feedbag/presence/locate/messaging handler, mutating `buddies`,
+  `incoming_messages`, `away_message` in place. This is also the natural
+  spot for a future Tauri layer to poll from and re-emit as frontend events.
+
+One thing that *did* change vs. the Swift version, not just a port: there's
+no `guard case .online = state` check scattered through every method
+anymore. In Rust, holding an `OscarSession` at all already proves login
+succeeded and BOS is connected — the type system does the job the runtime
+state enum did in Swift.
+
+`tests/session_integration.rs` extends the fake-server approach from
+`login_integration.rs` to this layer: a scripted fake BOS server drives a
+full round — buddy-list sync and ack, a presence arrival with the away bit
+set, an incoming IM, an outgoing reply, setting an away message, and a
+user-info round trip — and asserts the client's state (`buddies`,
+`incoming_messages`, `away_message`) ends up correct. Same caveat as ever:
+this proves the state machine and wire encoding are internally consistent,
+not that they match a real server — that's still a Wireshark-capture-against-Pidgin
+task for whenever there's a live Hetzner box to point this at.

@@ -1,0 +1,13 @@
+[package]
+name = "oscar-rs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "oscar_rs"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]

@@ -1,121 +1,63 @@
-# OSCARKit — scaffold
+# oscarkit
 
-A from-scratch Swift implementation of the client side of the OSCAR protocol,
-targeting a self-hosted [Open OSCAR Server](https://github.com/mk6i/open-oscar-server)
-instance rather than the (long dead) real AIM network.
+A cross-platform OSCAR protocol client for a self-hosted [Open OSCAR
+Server](https://github.com/mk6i/open-oscar-server) — retro AIM functionality,
+modern desktop app.
 
-## What's here
+## Pivot notice
 
-- **FLAP.swift** — the 6-byte framing header everything rides on top of.
-- **SNAC.swift** — the (family, subtype) command structure + TLV encoding, which
-  is how basically every OSCAR payload is actually built.
-- **FLAPConnection.swift** — an `NWConnection`-based socket that buffers partial
-  reads and emits complete `FLAPFrame`s.
-- **OSCARClient.swift** — the actual login state machine:
-  1. connect to the auth server, FLAP hello
-  2. request an auth key (SNAC 0x17/0x06) with your screen name
-  3. server sends back a challenge (0x17/0x07)
-  4. compute `MD5(authKey + MD5(password) + "AOL Instant Messenger (SM)")`
-     and send it as the login request (0x17/0x02)
-  5. server responds (0x17/0x03) with a BOS server address + session cookie
-  6. disconnect from auth, connect to BOS, FLAP hello carrying the cookie
-  7. once "host online" (0x01/0x03) arrives, you're live
-  8. send/receive plain-text IMs (family 0x04)
-- **ChatDemoView.swift** — a bare SwiftUI view proving the plumbing works.
-  Move this into your actual app target — it currently lives next to the
-  library code for convenience, which you don't want long-term (a library
-  target generally shouldn't import SwiftUI).
+This repo originally started as a native SwiftUI/iOS client. That direction
+is on hold (no working Mac to build for), and the project has moved to
+**Tauri**: a Rust backend + Vue 3/TypeScript frontend, targeting Linux,
+Windows, and macOS as a single lightweight desktop app rather than bundling
+a full Chromium runtime the way Electron does. The Swift work isn't lost
+knowledge — the protocol design (SNAC families, TLV structure, login state
+machine) carries over directly, just re-implemented in Rust.
 
-## What's deliberately NOT here yet
+## Why Rust for the backend, specifically
 
-Scoped out on purpose so the login + basic IM path could get done first:
+Tauri's webview (the part that would run Vue) can't open raw TCP sockets —
+that's a fundamental browser sandboxing restriction, not a Tauri limitation.
+So the entire OSCAR protocol implementation has to live in the Rust backend
+process, with the Vue frontend talking to it only through Tauri's IPC layer:
+`invoke()` calls for outbound actions (login, send message, set away
+status), and emitted events for things the server pushes at us (incoming
+messages, presence changes, buddy list updates).
 
-- **Rate limiting negotiation** (family 0x01, subtypes 0x06/0x07). Real AIM
-  clients always do this before anything else. Open OSCAR Server is lenient
-  about skipping it, but if you see mystery disconnects, this is the first
-  thing to add.
-- **Buddy list / presence** (family 0x03). No roster, no online/offline status.
-- **Away messages, warnings, buddy icons, chat rooms, file transfer.**
-- **Error recovery** — the FLAP reader bails out on a malformed frame instead
-  of trying to resync. Fine for a v0.1, not fine for production.
+## What's here so far
 
-## Before this will actually compile and connect
+- **`src/flap.rs`** — the 6-byte FLAP framing header everything rides on
+  top of. `FlapFrame::encode()` / `FlapFrame::parse_header()`.
+- **`src/snac.rs`** — the SNAC (family, subtype) command structure, plus TLV
+  encoding, which is how nearly every OSCAR payload is actually built.
+  `SnacFamily` currently covers Generic, Locate, BuddyPresence, Messaging,
+  Feedbag, and Authorization — matches what the original Swift scaffold had
+  worked out.
 
-1. Add this as a Swift Package to an Xcode project (or `swift build` a
-   command-line target first — much faster iteration loop than a full app
-   while you're debugging the wire protocol).
-2. Point `OSCARClient.init(host:)` at your Open OSCAR Server's
-   `OSCAR_ADVERTISED_LISTENERS_PLAIN` value.
-3. If your server is on WAN mode with an actual domain, `NWConnection` will
-   just work. If it's LAN-only with a bare IP, same deal — no changes needed.
+Both modules have unit tests (`cargo test`) covering encode/decode
+round-trips — these are internally self-consistent (encoding something and
+parsing it back gives you the same data), but **not yet verified against a
+real server**, same caveat as the Swift scaffold before it. The actual
+protocol byte layouts came from documentation and cross-client convention,
+not a live capture — a Wireshark comparison against Pidgin talking to your
+Open OSCAR Server instance is still the way to confirm these are exactly
+right once there's a full login flow to test.
 
-## How to verify the protocol details are actually right
+## What's not here yet
 
-The honest caveat: I wrote this from protocol documentation and libpurple's
-well-known OSCAR behavior, but I have not run it against a live server —
-your network sandbox doesn't allow reaching your VPS or home server. A few
-things worth double-checking once you have Open OSCAR Server running:
+Everything above the framing/encoding layer — the actual TCP connection
+handling (Tokio `TcpStream`), the login state machine (auth key exchange,
+MD5-roasted password, BOS handoff), messaging, buddy list (feedbag), away
+status, and — new to this iteration — the Tauri command/event layer and the
+Vue frontend itself. These existed in the Swift version and are next up to
+port.
 
-- **Capture real Pidgin traffic with Wireshark** while it logs into your
-  server. Compare frame-by-frame against what OSCARKit sends — this is the
-  fastest way to catch a wrong TLV type or byte offset.
-- The **exact byte layout of the ICBM send/receive message body** (the nested
-  TLV-inside-TLV "fragment" structure) is the single trickiest part of this
-  protocol and the place most homebrew clients get subtly wrong first. If
-  messages don't show up, check this first.
-- **DISABLE_AUTH**: while `DISABLE_AUTH=true` (the Open OSCAR Server default),
-  literally any password produces a valid login, so the MD5 roasting math
-  matters less for testing — you'll want to flip it to `false` deliberately
-  to confirm the hash computation is actually correct and not just being
-  ignored by the server.
+## Building
 
-## Suggested next milestone
+```bash
+cargo test    # runs the unit tests, no Tauri/frontend setup needed for this
+```
 
-Get `login()` reaching `.online` state against your real server, then get
-one IM sent and echoed back in a second client (Pidgin is the easiest ground
-truth). Everything else — buddy list, retro UI chrome, away messages — is
-much easier to add once that loop is proven out.
-
-## Update: buddy list (Feedbag.swift)
-
-Added the roster layer on top of the login/messaging scaffold:
-
-- **Fetching**: `requestBuddyList()` is called automatically once `state` hits
-  `.online`, mirroring what real clients do — roster comes down before
-  anything else is treated as ready.
-- **`buddies`** (published) is the UI-friendly view — screen name, group,
-  online status. **`feedbagItems`** is the raw synced roster, kept around so
-  add/remove can look up existing group/item IDs without re-fetching.
-- **Presence** (family 0x03, arrival/departure) is handled separately from
-  the roster itself — two different SNAC families cooperating to produce one
-  buddy list UI.
-- `addBuddy(screenName:toGroup:)` creates the group on the fly if it doesn't
-  exist yet, then inserts the buddy — two feedbag inserts under the hood.
-
-**Same caveat as everything else here**: the FEEDBAG_REPLY body layout
-(version byte + item count + items + trailing timestamp) is written from
-protocol documentation, not verified against live traffic. If your buddy
-list comes back empty or garbled after `requestBuddyList()`, this is the
-first place to check with a Wireshark capture of Pidgin's own feedbag sync.
-
-## Update: away messages (AwayStatus.swift)
-
-Added the Locate family (0x02) — profiles and away messages share this SNAC
-family, since they're really the same "info about a user" mechanism at the
-protocol level.
-
-- **`setAwayMessage(_:)`** — the *only* away mechanism in OSCAR. Passing text
-  sets it; passing `nil` sends an empty TLV, which is how you come back.
-  There's no separate away/available toggle command.
-- **`requestUserInfo(for:)`** — asks the server for a buddy's current away
-  text. Reply lands async and updates `Buddy.awayMessage` in place.
-- **`Buddy.isAway`** — this one's free: the presence arrival notification
-  (family 0x03) carries a status-flags TLV with an away bit, so you know
-  *whether* someone's away immediately on their arrival, with no extra
-  round-trip. The away message *text* is separate and requires the explicit
-  query above — OSCAR pushes the flag proactively but not the text.
-
-**Caveat, same as ever**: the exact TLV number carrying user-status flags in
-the arrival payload (0x0C here) and the away-bit position (0x0020) are
-written from cross-client convention, not verified against a live capture.
-If `isAway` doesn't flip when you'd expect, this is the spot to check first.
+Full Tauri scaffolding (`npm create tauri-app`, frontend deps, system
+webview libraries) comes once there's a connection layer worth putting a UI
+in front of.

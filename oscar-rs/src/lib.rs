@@ -8,7 +8,7 @@ pub mod server_address;
 pub mod snac;
 
 pub use client::{login, OscarError, OscarSession};
-pub use connection::FlapConnection;
+pub use connection::{FlapConnection, FlapReader, FlapWriter};
 pub use feedbag::{Buddy, FeedbagItem};
 pub use flap::{FlapChannel, FlapFrame};
 pub use messaging::IncomingIm;

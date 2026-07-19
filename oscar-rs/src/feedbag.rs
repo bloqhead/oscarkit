@@ -37,9 +37,11 @@ pub struct FeedbagItem {
 
 impl FeedbagItem {
     // Known class IDs. There are more (icon metadata, ignore list, etc.) —
-    // add as needed.
+    // add as needed. CLASS_PERMIT (0x0002, the allow-list counterpart to
+    // CLASS_DENY) stays out for now since nothing uses it yet.
     pub const CLASS_BUDDY: u16 = 0x0000;
     pub const CLASS_GROUP: u16 = 0x0001;
+    pub const CLASS_DENY: u16 = 0x0003; // block list — see add_to_block_list
 
     pub fn encode(&self) -> Vec<u8> {
         let name_bytes = self.name.as_bytes();
@@ -108,14 +110,18 @@ impl FeedbagItem {
 /// `is_online` gets flipped by family 0x03 (Buddy) arrival/departure
 /// notifications, which arrive as a separate stream from the feedbag list
 /// itself. `is_away`/`away_message` are populated from presence flags and
-/// the Locate family respectively — see `locate.rs`.
-#[derive(Debug, Clone, PartialEq)]
+/// the Locate family respectively — see `locate.rs`. `warning_level` comes
+/// from presence arrivals and ICBM warning replies (see `messaging.rs`);
+/// `is_blocked` reflects CLASS_DENY membership in the synced feedbag.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Buddy {
     pub screen_name: String,
     pub group_name: String,
     pub is_online: bool,
     pub is_away: bool,
     pub away_message: Option<String>,
+    pub warning_level: u16,
+    pub is_blocked: bool,
 }
 
 impl OscarSession {
@@ -141,7 +147,15 @@ impl OscarSession {
         self.bos_connection.send_snac(&Snac { header, body: item.encode() }).await?;
 
         // Optimistic local update — reconciled for real once 0x0E status comes back.
-        self.buddies.push(Buddy { screen_name: screen_name.to_string(), group_name: group_name.to_string(), is_online: false, is_away: false, away_message: None });
+        self.buddies.push(Buddy {
+            screen_name: screen_name.to_string(),
+            group_name: group_name.to_string(),
+            is_online: false,
+            is_away: false,
+            away_message: None,
+            warning_level: 0,
+            is_blocked: false,
+        });
         Ok(())
     }
 
@@ -153,6 +167,37 @@ impl OscarSession {
         let header = SnacHeader { family: SnacFamily::Feedbag.as_u16(), subtype: DELETE_ITEM, flags: 0, request_id: self.next_request_id() };
         self.bos_connection.send_snac(&Snac { header, body: existing.encode() }).await?;
         self.buddies.retain(|b| b.screen_name != screen_name);
+        Ok(())
+    }
+
+    /// Adds a screen name to your block (deny) list — the OSCAR mechanism
+    /// behind "blocking" someone: they can no longer see your presence or
+    /// message you. Unlike buddies, block-list entries need no group.
+    pub async fn add_to_block_list(&mut self, screen_name: &str) -> Result<(), OscarError> {
+        if self.feedbag_items.iter().any(|i| i.class_id == FeedbagItem::CLASS_DENY && i.name == screen_name) {
+            return Ok(());
+        }
+        let item_id = self.next_feedbag_item_id();
+        let item = FeedbagItem { name: screen_name.to_string(), group_id: 0, item_id, class_id: FeedbagItem::CLASS_DENY, attributes: Vec::new() };
+        let header = SnacHeader { family: SnacFamily::Feedbag.as_u16(), subtype: INSERT_ITEM, flags: 0, request_id: self.next_request_id() };
+        self.bos_connection.send_snac(&Snac { header, body: item.encode() }).await?;
+        self.feedbag_items.push(item);
+        if let Some(buddy) = self.buddies.iter_mut().find(|b| b.screen_name == screen_name) {
+            buddy.is_blocked = true;
+        }
+        Ok(())
+    }
+
+    pub async fn remove_from_block_list(&mut self, screen_name: &str) -> Result<(), OscarError> {
+        let Some(existing) = self.feedbag_items.iter().find(|i| i.class_id == FeedbagItem::CLASS_DENY && i.name == screen_name).cloned() else {
+            return Ok(());
+        };
+        let header = SnacHeader { family: SnacFamily::Feedbag.as_u16(), subtype: DELETE_ITEM, flags: 0, request_id: self.next_request_id() };
+        self.bos_connection.send_snac(&Snac { header, body: existing.encode() }).await?;
+        self.feedbag_items.retain(|i| !(i.class_id == FeedbagItem::CLASS_DENY && i.name == screen_name));
+        if let Some(buddy) = self.buddies.iter_mut().find(|b| b.screen_name == screen_name) {
+            buddy.is_blocked = false;
+        }
         Ok(())
     }
 
@@ -183,8 +228,12 @@ impl OscarSession {
                         .get(&0x0C)
                         .map(|data| data.len() >= 2 && u16::from_be_bytes([data[0], data[1]]) & 0x0020 != 0)
                         .unwrap_or(false);
+                    // Warning ("evil") level, TLV 0x0A, same permille (0-1000)
+                    // scale as the ICBM warning reply in messaging.rs.
+                    let warning_level = tlvs.get(&0x0A).map(|data| if data.len() >= 2 { u16::from_be_bytes([data[0], data[1]]) } else { 0 }).unwrap_or(0);
                     self.set_online(&name, true);
                     self.set_away(&name, is_away);
+                    self.set_warning_level(&name, warning_level);
                 }
             }
             0x0C => {
@@ -217,6 +266,9 @@ impl OscarSession {
             group_names.insert(item.item_id, item.name.clone());
         }
 
+        let denied: std::collections::HashSet<&str> =
+            items.iter().filter(|i| i.class_id == FeedbagItem::CLASS_DENY).map(|i| i.name.as_str()).collect();
+
         self.buddies = items
             .iter()
             .filter(|i| i.class_id == FeedbagItem::CLASS_BUDDY)
@@ -227,6 +279,8 @@ impl OscarSession {
                 is_online: false,
                 is_away: false,
                 away_message: None,
+                warning_level: 0,
+                is_blocked: denied.contains(i.name.as_str()),
             })
             .collect();
 
@@ -253,6 +307,13 @@ impl OscarSession {
     fn set_away(&mut self, screen_name: &str, away: bool) {
         if let Some(buddy) = self.buddies.iter_mut().find(|b| b.screen_name == screen_name) {
             buddy.is_away = away;
+        }
+    }
+
+    /// Also called from `messaging.rs`'s ICBM warning-reply handler, hence `pub(crate)`.
+    pub(crate) fn set_warning_level(&mut self, screen_name: &str, level: u16) {
+        if let Some(buddy) = self.buddies.iter_mut().find(|b| b.screen_name == screen_name) {
+            buddy.warning_level = level;
         }
     }
 

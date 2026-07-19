@@ -50,10 +50,12 @@ async fn serve_bos_session(mut conn: FlapConnection) {
     assert_eq!(snac.header.family, SnacFamily::Feedbag.as_u16());
     assert_eq!(snac.header.subtype, 0x06);
 
-    // Presence: Buddy1 arrives online and away (status-flags TLV 0x0C, bit 0x0020).
+    // Presence: Buddy1 arrives online, away (status-flags TLV 0x0C, bit
+    // 0x0020), and already carrying a warning level (TLV 0x0A, 25.0%).
     let mut arrival_body = vec![6u8];
     arrival_body.extend_from_slice(b"Buddy1");
     arrival_body.extend(Tlv::new(0x0C, 0x0020u16.to_be_bytes().to_vec()).encode());
+    arrival_body.extend(Tlv::new(0x0A, 250u16.to_be_bytes().to_vec()).encode());
     let arrival = Snac {
         header: SnacHeader { family: SnacFamily::BuddyPresence.as_u16(), subtype: 0x0B, flags: 0, request_id: 3 },
         body: arrival_body,
@@ -117,6 +119,44 @@ async fn serve_bos_session(mut conn: FlapConnection) {
         body: reply_body,
     };
     conn.send_snac(&user_info_reply).await.unwrap();
+
+    // Client sends a warning to Buddy1 (Messaging family, subtype 0x08).
+    let warning_request = conn.read_frame().await.unwrap().unwrap();
+    let snac = Snac::parse(&warning_request.payload).unwrap();
+    assert_eq!(snac.header.family, SnacFamily::Messaging.as_u16());
+    assert_eq!(snac.header.subtype, 0x08);
+    assert_eq!(u16::from_be_bytes([snac.body[0], snac.body[1]]), 0); // not anonymous
+    let name_len = snac.body[2] as usize;
+    assert_eq!(String::from_utf8_lossy(&snac.body[3..3 + name_len]), "Buddy1");
+
+    // Reply with Buddy1's new warning level (subtype 0x09), echoing the
+    // request_id the client used so it can attribute this back to Buddy1.
+    let mut warning_reply_body = 0u16.to_be_bytes().to_vec(); // old level
+    warning_reply_body.extend_from_slice(&500u16.to_be_bytes()); // new level, 50.0%
+    let warning_reply = Snac {
+        header: SnacHeader { family: SnacFamily::Messaging.as_u16(), subtype: 0x09, flags: 0, request_id: snac.header.request_id },
+        body: warning_reply_body,
+    };
+    conn.send_snac(&warning_reply).await.unwrap();
+
+    // Client adds Buddy1 to the block list (Feedbag family, subtype 0x08
+    // "insert item", class_id 0x0003 "deny").
+    let block_request = conn.read_frame().await.unwrap().unwrap();
+    let snac = Snac::parse(&block_request.payload).unwrap();
+    assert_eq!(snac.header.family, SnacFamily::Feedbag.as_u16());
+    assert_eq!(snac.header.subtype, 0x08);
+    let (item, _) = FeedbagItem::parse(&snac.body).unwrap();
+    assert_eq!(item.name, "Buddy1");
+    assert_eq!(item.class_id, FeedbagItem::CLASS_DENY);
+
+    // Client removes Buddy1 from the block list (subtype 0x0A "delete item").
+    let unblock_request = conn.read_frame().await.unwrap().unwrap();
+    let snac = Snac::parse(&unblock_request.payload).unwrap();
+    assert_eq!(snac.header.family, SnacFamily::Feedbag.as_u16());
+    assert_eq!(snac.header.subtype, 0x0A);
+    let (item, _) = FeedbagItem::parse(&snac.body).unwrap();
+    assert_eq!(item.name, "Buddy1");
+    assert_eq!(item.class_id, FeedbagItem::CLASS_DENY);
 }
 
 #[tokio::test]
@@ -166,13 +206,22 @@ async fn feedbag_presence_messaging_and_away_status_round_trip() {
     session.handle_next_frame().await.unwrap();
     assert_eq!(
         session.buddies,
-        vec![Buddy { screen_name: "Buddy1".to_string(), group_name: "Buddies".to_string(), is_online: false, is_away: false, away_message: None }]
+        vec![Buddy {
+            screen_name: "Buddy1".to_string(),
+            group_name: "Buddies".to_string(),
+            is_online: false,
+            is_away: false,
+            away_message: None,
+            warning_level: 0,
+            is_blocked: false,
+        }]
     );
 
-    // Presence arrival, away.
+    // Presence arrival, away, and already-warned.
     session.handle_next_frame().await.unwrap();
     assert!(session.buddies[0].is_online);
     assert!(session.buddies[0].is_away);
+    assert_eq!(session.buddies[0].warning_level, 250);
 
     // Incoming IM.
     session.handle_next_frame().await.unwrap();
@@ -189,6 +238,16 @@ async fn feedbag_presence_messaging_and_away_status_round_trip() {
     // Buddy1's away-message reply.
     session.handle_next_frame().await.unwrap();
     assert_eq!(session.buddies[0].away_message.as_deref(), Some("On a call"));
+
+    // Warn Buddy1, then block and unblock them.
+    session.send_warning("Buddy1", false).await.unwrap();
+    session.handle_next_frame().await.unwrap();
+    assert_eq!(session.buddies[0].warning_level, 500);
+
+    session.add_to_block_list("Buddy1").await.unwrap();
+    assert!(session.buddies[0].is_blocked);
+    session.remove_from_block_list("Buddy1").await.unwrap();
+    assert!(!session.buddies[0].is_blocked);
 
     auth_task.await.unwrap();
     bos_task.await.unwrap();

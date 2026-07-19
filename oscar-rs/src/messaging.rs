@@ -7,9 +7,11 @@ use crate::snac::{Snac, SnacFamily, SnacHeader, Tlv};
 
 const SEND_IM: u16 = 0x06;
 pub(crate) const INCOMING_IM: u16 = 0x07;
+const SEND_WARNING: u16 = 0x08;
+pub(crate) const WARNING_REPLY: u16 = 0x09;
 
 /// An instant message received from another user.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct IncomingIm {
     pub from: String,
     pub text: String,
@@ -48,6 +50,40 @@ impl OscarSession {
         let header = SnacHeader { family: SnacFamily::Messaging.as_u16(), subtype: SEND_IM, flags: 0, request_id: self.next_request_id() };
         self.bos_connection.send_snac(&Snac { header, body }).await?;
         Ok(())
+    }
+
+    /// Sends an ICBM warning ("evil") to a buddy — the mechanism behind the
+    /// classic AIM "Warn" button. Request body: 2-byte flags (bit 0x0001 =
+    /// anonymous) + BUF screen name. The reply (subtype 0x09) carries the
+    /// target's old/new warning level but no screen name, so attribution
+    /// relies on matching the request_id back up — see `handle_warning_reply`.
+    pub async fn send_warning(&mut self, screen_name: &str, anonymous: bool) -> Result<(), OscarError> {
+        let mut body = Vec::new();
+        let flags: u16 = if anonymous { 0x0001 } else { 0 };
+        body.extend_from_slice(&flags.to_be_bytes());
+        let name_bytes = screen_name.as_bytes();
+        body.push(name_bytes.len() as u8);
+        body.extend_from_slice(name_bytes);
+
+        let request_id = self.next_request_id();
+        let header = SnacHeader { family: SnacFamily::Messaging.as_u16(), subtype: SEND_WARNING, flags: 0, request_id };
+        self.bos_connection.send_snac(&Snac { header, body }).await?;
+        self.pending_warnings.insert(request_id, screen_name.to_string());
+        Ok(())
+    }
+
+    /// Family 0x04 subtype 0x09 — reply to a warning we sent. Body: 2-byte
+    /// old level, 2-byte new level (both a 0-1000 permille, i.e. percent*10).
+    /// Best-effort layout, same caveat as elsewhere in this codebase —
+    /// unverified against a real server capture.
+    pub(crate) fn handle_warning_reply(&mut self, snac: &Snac) {
+        if snac.body.len() < 4 {
+            return;
+        }
+        let new_level = u16::from_be_bytes([snac.body[2], snac.body[3]]);
+        if let Some(screen_name) = self.pending_warnings.remove(&snac.header.request_id) {
+            self.set_warning_level(&screen_name, new_level);
+        }
     }
 }
 

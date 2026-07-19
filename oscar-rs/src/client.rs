@@ -7,9 +7,11 @@
 //! (long-dead) AOL servers this same flow mostly applied too — the protocol
 //! hasn't changed, only who's running it.
 
-use crate::connection::FlapConnection;
+use std::collections::HashMap;
+
+use crate::connection::{FlapConnection, FlapReader, FlapWriter};
 use crate::feedbag::{Buddy, FeedbagItem};
-use crate::flap::FlapChannel;
+use crate::flap::{FlapChannel, FlapFrame};
 use crate::messaging::IncomingIm;
 use crate::server_address::ServerAddress;
 use crate::snac::{Snac, SnacFamily, SnacHeader, Tlv};
@@ -32,7 +34,12 @@ pub enum OscarError {
 /// messages (`messaging.rs`). Call `handle_next_frame` in a loop to keep
 /// this state current as the server pushes updates.
 pub struct OscarSession {
-    pub bos_connection: FlapConnection,
+    pub bos_connection: FlapWriter,
+    /// The read half of the BOS connection. Taken out via `split_reader()`
+    /// by callers (like the Tauri layer) that want to run the read loop on
+    /// a dedicated task instead of calling `handle_next_frame` directly —
+    /// see that method's doc comment for why this matters.
+    bos_reader: Option<FlapReader>,
     pub screen_name: String,
 
     /// Your synced buddy list, reconciled from feedbag + live presence
@@ -53,6 +60,10 @@ pub struct OscarSession {
 
     ids: RequestIdCounter,
     feedbag_item_id_counter: u16,
+    /// Screen names of buddies we've sent an ICBM warning to, keyed by the
+    /// request_id of that warning SNAC, so the (screen-name-less) reply can
+    /// be attributed back to the right buddy. See `messaging.rs::send_warning`.
+    pub(crate) pending_warnings: HashMap<u32, String>,
 }
 
 /// The *only* password hashing OSCAR uses: a chained MD5 combining the
@@ -97,25 +108,48 @@ impl OscarSession {
         self.feedbag_item_id_counter
     }
 
+    /// Takes the read half of the BOS connection out of the session so a
+    /// caller can run it on its own task — e.g. the Tauri layer's dedicated
+    /// reader task, which forwards parsed frames over a channel to an actor
+    /// that owns the rest of the session. Panics if called twice on the
+    /// same session (there's only one read half to give out).
+    pub fn split_reader(&mut self) -> FlapReader {
+        self.bos_reader.take().expect("split_reader() called twice on the same OscarSession")
+    }
+
     /// Reads one FLAP frame from the BOS connection and, if it carries a
     /// SNAC this client understands, dispatches it to the matching
     /// handler — updating `buddies`, `incoming_messages`, `away_message`,
     /// etc. in place. Call this in a loop once logged in to keep session
-    /// state current; this is also the natural place for a future Tauri
-    /// layer to poll from and re-emit as frontend events.
+    /// state current. If you've called `split_reader()` (e.g. to run the
+    /// read loop on a separate task), read frames from that `FlapReader`
+    /// instead and pass them to `dispatch_frame` directly.
     pub async fn handle_next_frame(&mut self) -> Result<(), OscarError> {
-        let frame = self.bos_connection.read_frame().await?.ok_or(OscarError::ConnectionClosed("bos session"))?;
+        let reader = self.bos_reader.as_mut().expect("bos_reader missing — was split_reader() already called?");
+        let frame = reader.read_frame().await?.ok_or(OscarError::ConnectionClosed("bos session"))?;
+        self.dispatch_frame(frame).await
+    }
+
+    /// Parses and dispatches a single FLAP frame already read off the BOS
+    /// connection — the shared logic behind `handle_next_frame`, split out
+    /// so a caller running its own read loop (via `split_reader`) can feed
+    /// frames in without going through this session's own reader half.
+    pub async fn dispatch_frame(&mut self, frame: FlapFrame) -> Result<(), OscarError> {
         if frame.channel != FlapChannel::Data {
             return Ok(());
         }
         let Some(snac) = Snac::parse(&frame.payload) else { return Ok(()) };
 
         match SnacFamily::from_u16(snac.header.family) {
-            Some(SnacFamily::Messaging) if snac.header.subtype == crate::messaging::INCOMING_IM => {
-                if let Some(im) = crate::messaging::parse_incoming_im(&snac.body) {
-                    self.incoming_messages.push(im);
+            Some(SnacFamily::Messaging) => match snac.header.subtype {
+                crate::messaging::INCOMING_IM => {
+                    if let Some(im) = crate::messaging::parse_incoming_im(&snac.body) {
+                        self.incoming_messages.push(im);
+                    }
                 }
-            }
+                crate::messaging::WARNING_REPLY => self.handle_warning_reply(&snac),
+                _ => {}
+            },
             Some(SnacFamily::Feedbag) => self.handle_feedbag_frame(&snac).await?,
             Some(SnacFamily::BuddyPresence) => self.handle_presence_frame(&snac),
             Some(SnacFamily::Locate) => self.handle_locate_frame(&snac),
@@ -242,8 +276,10 @@ pub async fn login(server: &ServerAddress, screen_name: &str, password: &str) ->
         }
     }
 
+    let (bos_reader, bos_writer) = bos.into_split();
     let mut session = OscarSession {
-        bos_connection: bos,
+        bos_connection: bos_writer,
+        bos_reader: Some(bos_reader),
         screen_name: screen_name.to_string(),
         buddies: Vec::new(),
         feedbag_items: Vec::new(),
@@ -251,6 +287,7 @@ pub async fn login(server: &ServerAddress, screen_name: &str, password: &str) ->
         incoming_messages: Vec::new(),
         ids: RequestIdCounter(0),
         feedbag_item_id_counter: 1,
+        pending_warnings: HashMap::new(),
     };
 
     // Roster is foundational session state — fetch it as soon as we're

@@ -59,6 +59,15 @@ npm run tauri dev        # launches the actual desktop app (needs webview
                           # for your OS if this fails to compile)
 ```
 
+On Linux, `npm run tauri dev` needs `webkit2gtk`/`gtk3`/`glib`/`gstreamer` `-devel` packages
+(with matching `pkg-config` files) to even *compile*, separate from whatever's
+already installed at runtime — see [Tauri's Linux
+prerequisites](https://tauri.app/start/prerequisites/#linux) if `cargo build`
+fails with `pkg-config`/GStreamer linker errors. On NVIDIA + Wayland setups,
+WebKitGTK's DMA-BUF renderer can also crash the window on launch (`Error 71
+(Protocol error) dispatching to Wayland display`) — work around it with
+`WEBKIT_DISABLE_DMABUF_RENDERER=1 npm run tauri dev`.
+
 This repo is now a Cargo workspace: `oscar-rs/` is the protocol library
 (`cargo test -p oscar-rs` runs its tests without needing any frontend/Tauri
 setup at all), `src-tauri/` is the Tauri app crate, and the Vue+TS frontend
@@ -211,3 +220,43 @@ build scripts need even to compile (confirmed missing, and not installable
 without root). That check, and the actual `npm run tauri dev` /
 real-Open-OSCAR-Server login this bridge exists for, are the next things to
 run on a machine with the full Tauri prerequisites installed.
+
+## Update: first real-server login — a real bug, found and fixed
+
+`npm run tauri dev` finally ran against a real, self-hosted Open OSCAR Server
+instance (not the fake ones the test suite stands up) — and it immediately
+surfaced a genuine byte-layout bug that no amount of internally-consistent
+fake-server testing could have caught, exactly the caveat this README has
+been repeating since the very first commit.
+
+**The bug:** `login()`'s auth-key/challenge-response parsing (family 0x17,
+subtype 0x07) assumed the body was a TLV block and looked for a "TLV 0x01"
+containing the challenge string. Every real server rejected this — the
+error was always `unexpected or malformed response: auth key TLV (0x01)
+missing from challenge reply`.
+
+**The fix:** checked Open OSCAR Server's own Go source
+(`wire.SNAC_0x17_0x07_BUCPChallengeResponse`) instead of guessing again —
+turns out this specific reply is *not* a TLV at all:
+
+```go
+type SNAC_0x17_0x07_BUCPChallengeResponse struct {
+    AuthKey string `oscar:"len_prefix=uint16"`
+}
+```
+
+Just a plain 2-byte big-endian length prefix followed by that many bytes of
+challenge string — no type field, no TLV framing. `oscar-rs/src/client.rs`
+now parses it that way directly. Everything *else* checked against the same
+source turned out to already be correct: the outgoing challenge request (TLV
+0x01 = screen name) and the login response (TLVs 0x01/0x05/0x06/0x08 for
+screen name/BOS address/cookie/error code) are genuinely TLV-based and
+matched what this codebase already assumed. `oscar-rs/tests/login_integration.rs`'s
+fake server was encoding the same wrong assumption and has been corrected to
+match.
+
+**Confirmed working against a real Open OSCAR Server**, not just the fake
+ones in the test suite: login (full auth handshake + BOS handoff),
+`send_message` (ICBM), and `set_away_message` (Locate). **Still unverified
+against a real server**: buddy-list sync/presence, ICBM warning, and the
+feedbag block list — those are the next things to exercise for real.

@@ -21,9 +21,12 @@ async fn serve_auth(mut conn: FlapConnection, bos_address: &str) {
     assert_eq!(snac.header.family, SnacFamily::Authorization.as_u16());
     assert_eq!(snac.header.subtype, 0x06);
 
-    // Reply with a fixed auth key.
+    // Reply with a fixed auth key. Per Open OSCAR Server's own source
+    // (wire.SNAC_0x17_0x07_BUCPChallengeResponse), this body is NOT a TLV —
+    // it's a plain `len_prefix=uint16` string: 2-byte length + raw bytes.
     let auth_key = b"fake-challenge-bytes".to_vec();
-    let reply_body = Tlv::new(0x01, auth_key).encode();
+    let mut reply_body = (auth_key.len() as u16).to_be_bytes().to_vec();
+    reply_body.extend_from_slice(&auth_key);
     let reply = Snac {
         header: SnacHeader { family: SnacFamily::Authorization.as_u16(), subtype: 0x07, flags: 0, request_id: 1 },
         body: reply_body,
@@ -108,7 +111,11 @@ async fn login_surfaces_server_rejection_as_an_error() {
 
         let auth_key_reply = Snac {
             header: SnacHeader { family: SnacFamily::Authorization.as_u16(), subtype: 0x07, flags: 0, request_id: 1 },
-            body: Tlv::new(0x01, b"key".to_vec()).encode(),
+            body: {
+                let mut body = 3u16.to_be_bytes().to_vec(); // "key".len()
+                body.extend_from_slice(b"key");
+                body
+            },
         };
         conn.send_snac(&auth_key_reply).await.unwrap();
 

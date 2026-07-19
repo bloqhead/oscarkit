@@ -189,11 +189,19 @@ pub async fn login(server: &ServerAddress, screen_name: &str, password: &str) ->
         }
         let Some(snac) = Snac::parse(&frame.payload) else { continue };
         if snac.header.family == SnacFamily::Authorization.as_u16() && snac.header.subtype == 0x07 {
-            let tlvs = Tlv::parse_all(&snac.body);
-            break tlvs
-                .get(&0x01)
-                .cloned()
-                .ok_or(OscarError::UnexpectedResponse("auth key TLV (0x01) missing from challenge reply"))?;
+            // Confirmed against Open OSCAR Server's own source (wire.SNAC_0x17_0x07_BUCPChallengeResponse):
+            // unlike the login request/response, this body is NOT a TLV block — it's a
+            // plain `oscar:"len_prefix=uint16"` string: 2-byte big-endian length, then
+            // that many bytes of auth key, nothing else.
+            let body = &snac.body;
+            if body.len() < 2 {
+                return Err(OscarError::UnexpectedResponse("challenge reply shorter than its length prefix"));
+            }
+            let key_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+            if body.len() < 2 + key_len {
+                return Err(OscarError::UnexpectedResponse("challenge reply truncated before end of auth key"));
+            }
+            break body[2..2 + key_len].to_vec();
         }
     };
 

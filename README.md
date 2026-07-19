@@ -61,3 +61,43 @@ cargo test    # runs the unit tests, no Tauri/frontend setup needed for this
 Full Tauri scaffolding (`npm create tauri-app`, frontend deps, system
 webview libraries) comes once there's a connection layer worth putting a UI
 in front of.
+
+## Update: connection layer + login (client.rs, connection.rs, server_address.rs)
+
+The client can now actually complete a full login — connect, auth
+handshake, BOS handoff — end to end.
+
+- **`server_address.rs`** — user-configurable server address parsing.
+  Accepts a bare host, `host:port`, or an `oscar://host:port` URL (scheme
+  is cosmetic, OSCAR isn't URL-addressed on the wire). This exists so the
+  app can offer a "server address" field instead of a hardcoded host —
+  anyone self-hosting Open OSCAR Server should be able to point this at
+  their own instance, not just Daryn's.
+- **`connection.rs`** — Tokio-based `FlapConnection`. Worth noting vs. the
+  Swift version: Tokio's `read_exact` reads "the next N bytes" directly, so
+  there's no manual buffer-and-drain loop the way `NWConnection`'s
+  callback-based reads needed. Same protocol, simpler implementation.
+- **`client.rs`** — the full login state machine: auth key challenge →
+  MD5-roasted password (`roast_password`, chained MD5 per libpurple
+  convention) → BOS handoff → wait for "host online". Returns an
+  `OscarSession` holding the live BOS connection, ready for messaging/buddy
+  list/away-status calls once those are ported next.
+
+### Actually verified this time, not just compiled
+
+`tests/login_integration.rs` stands up a **fake OSCAR server locally**
+(auth + BOS, both on `127.0.0.1`) and runs the real `login()` function
+against it — genuinely exercising the async state machine end to end,
+including a rejected-login path. This proves the code connects, round-trips
+four SNACs, and completes without deadlocking. It does **not** prove the
+byte layouts match a real server's expectations — that still needs a
+Wireshark capture against Pidgin talking to the actual Hetzner box, same
+caveat as everywhere else in this project. 23 tests total, `cargo test`
+passes clean with no warnings.
+
+### Not yet ported
+
+Messaging, buddy list (feedbag), away status — all existed in the Swift
+scaffold and are straightforward ports now that `OscarSession` exists to
+hang them off of. Also still pending: the actual Tauri shell (`invoke`
+commands, event emission) and the Vue frontend.

@@ -1,0 +1,37 @@
+:root {
+  --font-aim: 'Lucida Grande', 'Lucida Sans Unicode', sans-serif;
+
+  --titlebar-grad: linear-gradient(180deg, #4a86e8 0%, #1958c7 45%, #0d3f9e 100%);
+  --titlebar-border: #f2c200;
+  --titlebar-shadow: inset 0 2px 0 rgba(255, 255, 255, 0.4), inset 0 -2px 0 rgba(0, 0, 0, 0.25);
+
+  --signon-bg: linear-gradient(180deg, #dfe6ef, #b9c6d6);
+
+  --gold-grad: linear-gradient(180deg, #fff3b0, #ffce3a 45%, #e8a800);
+  --gold-border: #e8b923;
+  --gold-text: #5c3d00;
+
+  --secondary-grad: linear-gradient(180deg, #fdfcf6, #e4dfc9);
+  --secondary-border: #b9b39c;
+  --secondary-text: #4a4636;
+
+  --input-border: #8fa8bf;
+  --input-shadow: inset 0 1px 4px rgba(0, 0, 0, 0.25);
+
+  --color-online: #2fae4e;
+  --color-away: #e8a23a;
+  --color-offline: #cfcfcf;
+
+  --color-name-online: #0a3d91;
+  --color-name-away: #555555;
+  --color-name-offline: #aaaaaa;
+
+  --avatar-active-bg: #5b8fd8;
+  --avatar-offline-bg: #d8d8d8;
+
+  --badge-red: #c62828;
+
+  --away-banner-bg: #fff2c2;
+  --away-banner-border: #dcc35a;
+  --away-banner-text: #6b5410;
+}

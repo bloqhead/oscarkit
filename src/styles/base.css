@@ -1,0 +1,58 @@
+@import './tokens.css';
+
+* {
+  box-sizing: border-box;
+}
+
+html, body, #app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: system-ui, sans-serif;
+  background: #2b2b2b;
+}
+
+button {
+  font-family: var(--font-aim);
+  cursor: pointer;
+}
+
+.btn-gold {
+  border-radius: 4px;
+  border: 2px outset var(--gold-border);
+  background: var(--gold-grad);
+  font-weight: 700;
+  color: var(--gold-text);
+  padding: 8px 16px;
+  font-size: 14px;
+}
+
+.btn-gold:active {
+  border-style: inset;
+}
+
+.btn-secondary {
+  border-radius: 3px;
+  border: 2px outset var(--secondary-border);
+  background: var(--secondary-grad);
+  color: var(--secondary-text);
+  padding: 6px 12px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.btn-secondary:active {
+  border-style: inset;
+}
+
+.text-input {
+  border-radius: 2px;
+  border: 2px inset var(--input-border);
+  box-shadow: var(--input-shadow);
+  font-family: var(--font-aim);
+  padding: 8px 10px;
+  font-size: 14px;
+  width: 100%;
+}

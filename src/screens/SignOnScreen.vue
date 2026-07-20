@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref } from 'vue';
 import { useSession } from '../composables/useSession';
+import { unlockAudio } from '../utils/sound';
 
 const { login, errorMessage } = useSession();
 
@@ -11,6 +12,9 @@ const savePassword = ref(false);
 const isSubmitting = ref(false);
 
 async function handleSubmit(): Promise<void> {
+  // Must happen synchronously, inside this real user-gesture call stack —
+  // see unlockAudio()'s doc comment for why.
+  unlockAudio();
   isSubmitting.value = true;
   try {
     await login(server.value, screenName.value, password.value);

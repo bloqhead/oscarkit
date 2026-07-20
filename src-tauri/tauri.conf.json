@@ -13,8 +13,12 @@
     "windows": [
       {
         "title": "OSCARKit",
-        "width": 800,
-        "height": 600
+        "width": 360,
+        "height": 560,
+        "minWidth": 300,
+        "minHeight": 420,
+        "resizable": true,
+        "decorations": false
       }
     ],
     "security": {

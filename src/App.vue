@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { useSession } from './composables/useSession';
+import WindowControls from './components/WindowControls.vue';
 import SignOnScreen from './screens/SignOnScreen.vue';
 import BuddyListScreen from './screens/BuddyListScreen.vue';
 import ImScreen from './screens/ImScreen.vue';
@@ -12,6 +13,7 @@ const { currentScreen } = useSession();
 
 <template>
   <div class="app-shell">
+    <WindowControls />
     <div class="phone-frame">
       <SignOnScreen v-if="currentScreen === 'signon'" />
       <BuddyListScreen v-else-if="currentScreen === 'buddylist'" />
@@ -25,6 +27,7 @@ const { currentScreen } = useSession();
 
 <style scoped>
 .app-shell {
+  position: relative;
   height: 100%;
   display: flex;
   align-items: center;
@@ -33,7 +36,7 @@ const { currentScreen } = useSession();
 }
 
 .phone-frame {
-  width: 390px;
+  width: 340px;
   height: 100%;
   max-height: 780px;
   background: #fff;

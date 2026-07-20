@@ -30,13 +30,15 @@ jobs:
           CURRENT=$(jq -r '.version' src-tauri/tauri.conf.json)
           LAST_TAG=$(git tag --list 'v*' --sort=-v:refname | head -n1)
 
-          if [ -z "$LAST_TAG" ]; then
-            NEW_VERSION="$CURRENT"
-          else
-            LAST_VERSION=${LAST_TAG#v}
-            IFS='.' read -r MAJOR MINOR PATCH <<< "$LAST_VERSION"
-            NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
-          fi
+          # Always bump one patch above whichever baseline applies (the last
+          # release tag, or the version already on disk if none exists yet)
+          # so this always produces a real file diff to commit — reusing an
+          # unchanged version here means "nothing to commit", which aborts
+          # the job under `set -e`.
+          BASE_VERSION=${LAST_TAG#v}
+          BASE_VERSION=${BASE_VERSION:-$CURRENT}
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE_VERSION"
+          NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
 
           jq --arg v "$NEW_VERSION" '.version = $v' src-tauri/tauri.conf.json > /tmp/tauri.conf.json
           mv /tmp/tauri.conf.json src-tauri/tauri.conf.json

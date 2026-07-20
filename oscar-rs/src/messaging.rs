@@ -3,7 +3,7 @@
 //! same as "Feedbag" for the buddy list.
 
 use crate::client::{OscarError, OscarSession};
-use crate::snac::{Snac, SnacFamily, SnacHeader, Tlv};
+use crate::snac::{Snac, SnacFamily, SnacHeader, Tlv, UserInfo};
 
 const SEND_IM: u16 = 0x06;
 pub(crate) const INCOMING_IM: u16 = 0x07;
@@ -87,20 +87,20 @@ impl OscarSession {
     }
 }
 
-/// Layout: 8-byte cookie, 2-byte channel, then a BUF (1-byte length + name),
-/// then TLVs including 0x02 (message data) containing nested fragments.
+/// Layout: 8-byte cookie, 2-byte channel, then a `UserInfo` block for the
+/// sender (confirmed against Open OSCAR Server's
+/// `wire.SNAC_0x04_0x07_ICBMChannelMsgToClient`: name + raw warning level +
+/// TLV count + TLVs — *not* a bare name directly followed by plain TLVs, a
+/// wrong assumption that silently broke incoming-message parsing until
+/// checked against a real server), then the message's own TLVs including
+/// 0x02 (message data) containing nested fragments.
 pub(crate) fn parse_incoming_im(body: &[u8]) -> Option<IncomingIm> {
-    if body.len() <= 11 {
+    if body.len() <= 10 {
         return None;
     }
-    let mut index = 10usize; // skip cookie + channel
-    let name_length = body[index] as usize;
-    index += 1;
-    if index + name_length > body.len() {
-        return None;
-    }
-    let sender = String::from_utf8_lossy(&body[index..index + name_length]).to_string();
-    index += name_length;
+    let (sender_info, consumed) = UserInfo::parse(&body[10..])?; // skip cookie + channel
+    let index = 10 + consumed;
+    let sender = sender_info.screen_name;
 
     let tlvs = Tlv::parse_all(&body[index..]);
     let Some(message_tlv) = tlvs.get(&0x02) else {
@@ -126,8 +126,12 @@ mod tests {
     fn build_incoming_im_body(sender: &str, text: &str) -> Vec<u8> {
         let mut body = vec![0u8; 8]; // cookie
         body.extend_from_slice(&1u16.to_be_bytes()); // channel
+
+        // Sender UserInfo block: name, then raw warning level, then TLV count (0 here).
         body.push(sender.len() as u8);
         body.extend_from_slice(sender.as_bytes());
+        body.extend_from_slice(&0u16.to_be_bytes()); // warning level
+        body.extend_from_slice(&0u16.to_be_bytes()); // TLV count
 
         let mut message_inner = Vec::new();
         let mut text_fragment = vec![0x00, 0x00];

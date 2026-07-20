@@ -25,6 +25,13 @@ async fn serve_bos_session(mut conn: FlapConnection) {
     };
     conn.send_snac(&host_online).await.unwrap();
 
+    // Client announces "client online" (Generic family, subtype 0x02) right
+    // after host-online, before doing anything else.
+    let client_online = conn.read_frame().await.unwrap().unwrap();
+    let snac = Snac::parse(&client_online.payload).unwrap();
+    assert_eq!(snac.header.family, SnacFamily::Generic.as_u16());
+    assert_eq!(snac.header.subtype, 0x02);
+
     // Client requests the buddy list (Feedbag family, subtype 0x04).
     let request = conn.read_frame().await.unwrap().unwrap();
     let snac = Snac::parse(&request.payload).unwrap();
@@ -39,34 +46,44 @@ async fn serve_bos_session(mut conn: FlapConnection) {
     body.extend(buddy.encode());
     body.extend_from_slice(&[0, 0, 0, 0]); // trailing last-modified timestamp, ignored by the client
     let feedbag_reply = Snac {
-        header: SnacHeader { family: SnacFamily::Feedbag.as_u16(), subtype: 0x05, flags: 0, request_id: 2 },
+        header: SnacHeader { family: SnacFamily::Feedbag.as_u16(), subtype: 0x06, flags: 0, request_id: 2 },
         body,
     };
     conn.send_snac(&feedbag_reply).await.unwrap();
 
-    // Client acks receipt (subtype 0x06 "use") once it's processed the reply.
+    // Client acks receipt (subtype 0x07 "use") once it's processed the reply.
     let ack = conn.read_frame().await.unwrap().unwrap();
     let snac = Snac::parse(&ack.payload).unwrap();
     assert_eq!(snac.header.family, SnacFamily::Feedbag.as_u16());
-    assert_eq!(snac.header.subtype, 0x06);
+    assert_eq!(snac.header.subtype, 0x07);
 
-    // Presence: Buddy1 arrives online, away (status-flags TLV 0x0C, bit
-    // 0x0020), and already carrying a warning level (TLV 0x0A, 25.0%).
+    // Presence: Buddy1 arrives online, away, and already carrying a warning
+    // level (25.0%) — a UserInfo block: BUF name, raw warning level (not a
+    // TLV), TLV count, then that many TLVs (here: TLV 0x01 "user flags",
+    // bit 0x0020 = away). Deliberately sent as "BUDDY1" (different case
+    // from the "Buddy1" the feedbag reply used) — a real server did
+    // exactly this (mixed-case in one place, lowercase in another) and the
+    // client silently failed to match the two without case-insensitive
+    // comparison. See `client::screen_names_match`.
     let mut arrival_body = vec![6u8];
-    arrival_body.extend_from_slice(b"Buddy1");
-    arrival_body.extend(Tlv::new(0x0C, 0x0020u16.to_be_bytes().to_vec()).encode());
-    arrival_body.extend(Tlv::new(0x0A, 250u16.to_be_bytes().to_vec()).encode());
+    arrival_body.extend_from_slice(b"BUDDY1");
+    arrival_body.extend_from_slice(&250u16.to_be_bytes()); // warning level
+    arrival_body.extend_from_slice(&1u16.to_be_bytes()); // TLV count
+    arrival_body.extend(Tlv::new(0x01, 0x0020u16.to_be_bytes().to_vec()).encode());
     let arrival = Snac {
         header: SnacHeader { family: SnacFamily::BuddyPresence.as_u16(), subtype: 0x0B, flags: 0, request_id: 3 },
         body: arrival_body,
     };
     conn.send_snac(&arrival).await.unwrap();
 
-    // Incoming IM from Buddy1.
+    // Incoming IM from Buddy1 — same UserInfo-block-for-the-sender shape as
+    // the presence arrival above (name, raw warning level, TLV count).
     let mut im_body = vec![0u8; 8]; // cookie
     im_body.extend_from_slice(&1u16.to_be_bytes()); // channel
     im_body.push(6);
     im_body.extend_from_slice(b"Buddy1");
+    im_body.extend_from_slice(&0u16.to_be_bytes()); // warning level
+    im_body.extend_from_slice(&0u16.to_be_bytes()); // TLV count
     let mut message_inner = Vec::new();
     let mut text_fragment = vec![0x00, 0x00];
     text_fragment.extend_from_slice(b"hey there");
@@ -102,17 +119,23 @@ async fn serve_bos_session(mut conn: FlapConnection) {
     let tlvs = Tlv::parse_all(&snac.body);
     assert_eq!(String::from_utf8_lossy(tlvs.get(&0x04).unwrap()), "brb");
 
-    // Client asks for Buddy1's info (subtype 0x05 "user info query").
+    // Client asks for Buddy1's info (subtype 0x05 "user info query"). Not
+    // TLVs — a raw 2-byte request-type field, then a BUF screen name.
     let query = conn.read_frame().await.unwrap().unwrap();
     let snac = Snac::parse(&query.payload).unwrap();
     assert_eq!(snac.header.family, SnacFamily::Locate.as_u16());
     assert_eq!(snac.header.subtype, 0x05);
-    let tlvs = Tlv::parse_all(&snac.body);
-    assert_eq!(String::from_utf8_lossy(tlvs.get(&0x01).unwrap()), "Buddy1");
+    assert_eq!(u16::from_be_bytes([snac.body[0], snac.body[1]]), 0x0002); // "unavailable"/away bit
+    let name_len = snac.body[2] as usize;
+    assert_eq!(String::from_utf8_lossy(&snac.body[3..3 + name_len]), "Buddy1");
 
-    // Reply with Buddy1's away message.
+    // Reply with Buddy1's away message: a UserInfo block (name, warning,
+    // TLV count) followed by a separate plain TLV run for the actual
+    // profile/away-message data.
     let mut reply_body = vec![6u8];
     reply_body.extend_from_slice(b"Buddy1");
+    reply_body.extend_from_slice(&0u16.to_be_bytes()); // warning level
+    reply_body.extend_from_slice(&0u16.to_be_bytes()); // TLV count (none in the UserInfo block itself)
     reply_body.extend(Tlv::new(0x04, b"On a call".to_vec()).encode());
     let user_info_reply = Snac {
         header: SnacHeader { family: SnacFamily::Locate.as_u16(), subtype: 0x06, flags: 0, request_id: 5 },

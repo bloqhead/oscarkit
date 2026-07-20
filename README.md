@@ -260,3 +260,363 @@ ones in the test suite: login (full auth handshake + BOS handoff),
 `send_message` (ICBM), and `set_away_message` (Locate). **Still unverified
 against a real server**: buddy-list sync/presence, ICBM warning, and the
 feedbag block list — those are the next things to exercise for real.
+
+## Update: three more real bugs — the `UserInfo` block
+
+Ran two real, simultaneous Tauri instances against the same Open OSCAR
+Server (two screen names, added as each other's buddies) to test presence,
+messaging, and away-info in both directions at once. Sending a message
+reported success on both sides, but **nothing ever showed up as an incoming
+message** — the next real-server bug, and a more structural one than the
+challenge-response fix.
+
+**The bug, in one shape, hitting three places:** every SNAC that embeds a
+buddy's identity — presence arrival/departure (family 0x03), the sender of
+an incoming ICBM message (family 0x04), and a Locate user-info reply (family
+0x02) — was assumed to be a plain length-prefixed name immediately followed
+by ordinary TLVs. Checked against Open OSCAR Server's `wire.TLVUserInfo`:
+that's wrong. The real shape is name, then a **raw 2-byte warning level (not
+a TLV)**, then a **TLV *count*** (not a byte length like everywhere else in
+this codebase), then that many TLVs:
+
+```go
+func (s *Session) TLVUserInfo() wire.TLVUserInfo {
+    return wire.TLVUserInfo{
+        ScreenName:   s.DisplayScreenName().String(),
+        WarningLevel: s.Warning(),
+        TLVBlock:     wire.TLVBlock{TLVList: s.userInfo()}, // TLVBlock = 2-byte TLV count prefix
+    }
+}
+```
+
+Skipping straight from the name into `Tlv::parse_all` (what this code did
+before) means the first 4 bytes it reads as a bogus TLV type+length are
+actually the warning level and TLV count — enough to desync every read after
+it. For the incoming-message case specifically, that desync was severe
+enough that the message TLV (0x02) was never found, so the message was
+silently dropped rather than displayed — exactly what surfaced as "sent
+successfully but never received."
+
+**The fix:** added `oscar_rs::UserInfo` (in `snac.rs`, next to `Tlv` — this
+block is generic enough to live alongside the other shared wire-format
+helpers, not tied to any one SNAC family) with a `parse` method that
+consumes name, warning level, and exactly `count` TLVs, returning how many
+bytes it took so the caller can find whatever comes after. Used it in:
+
+- **`feedbag.rs`** — presence arrival/departure. Also fixed the away-flag
+  TLV number itself: it was `0x0C` (guessed), should be `0x01`
+  ("user flags", bit `0x0020`) or `0x06` ("status", a `u32`, bit
+  `0x00000001`) depending on server — now checks both. Warning level no
+  longer comes from a nonexistent "TLV 0x0A"; it's `UserInfo.warning_level`
+  directly.
+- **`messaging.rs`** — the actual reported bug: `parse_incoming_im` now
+  parses the sender as a `UserInfo` block before looking for the message
+  TLVs that follow it.
+- **`locate.rs`** — same reply-parsing bug, plus a *second*, unrelated bug
+  in the outgoing request: `SNAC_0x02_0x05_LocateUserInfoQuery` isn't TLVs
+  at all (raw `u16` request-type field, then a BUF screen name — TLV-type
+  first was also backwards vs. what this code sent), and the request was
+  asking for bit `0x0001` (profile) instead of `0x0002`
+  ("unavailable"/away) — so `request_user_info` was structurally wrong *and*
+  requesting the wrong thing.
+
+`oscar-rs/tests/session_integration.rs`'s fake server encoded all three
+wrong assumptions and has been corrected to match the real shape throughout.
+
+**Confirmed working against a real Open OSCAR Server**: login, `send_message`
+(the *send* path), `set_away_message`. **Still to verify for real** now that
+the parsing bugs above are fixed: incoming messages, presence/warning
+display, buddy-info lookup, and the block list.
+
+## Update: the buddy list was never actually syncing — two more bugs, in `FeedbagItem`
+
+Retested with two real, simultaneous accounts after the `UserInfo` fix
+above. Still no online status, buddies added in one session vanished on the
+next login, and messages still didn't arrive. All three traced back to the
+same place: **the buddy list has never once successfully synced against a
+real server**, from the very first real-server test onward. Two bugs, both
+silent (no error surfaced anywhere):
+
+**Bug 1 — wrong reply subtype.** This code listened for the buddy-list
+reply on subtype `0x05`. Checked against Open OSCAR Server's
+`wire.Feedbag*` subtype constants: the real reply subtype is `0x06`. `0x05`
+is a *different* client-to-server message (`FeedbagQueryIfModified`) this
+client never even sends. Since the dispatch match on `REPLY` never fired,
+every real feedbag reply silently fell through to the no-op default case —
+`self.buddies` has only ever reflected optimistic local state (buddies
+added this session), never anything the server actually confirmed.
+
+**Bug 2 — wrong name-length prefix in `FeedbagItem`.** Confirmed against
+`wire.FeedbagItem`:
+
+```go
+type FeedbagItem struct {
+    Name    string `oscar:"len_prefix=uint8"`
+    GroupID uint16
+    ItemID  uint16
+    ClassID uint16
+    TLVBlock
+}
+```
+
+This code encoded the name with a 2-byte length prefix; the real format
+uses **one byte**, same as every other name field in the protocol. A server
+reading a `FeedbagItem` this code sent would read only the first (always
+`0x00`) byte as the *entire* name length — every buddy this client ever
+tried to add went over the wire as a zero-length name followed by garbage.
+That's the direct explanation for adds not persisting: the server had every
+reason to reject or mangle the insert. `attributes` had the same class of
+bug (a raw byte-length-prefixed blob instead of `TLVBlock`'s TLV-*count*
+prefix + actual TLVs) — currently harmless since this codebase always sends
+empty attributes, but fixed for correctness anyway (`FeedbagItem.attributes`
+is now `Vec<Tlv>`, not `Vec<u8>`).
+
+**The fix:** corrected `REPLY`/`USE` to `0x06`/`0x07` in `feedbag.rs`, fixed
+`FeedbagItem::encode`/`parse` to use a one-byte name length and proper
+`TLVBlock` attributes, and added `Tlv::parse_n` (in `snac.rs`) — a bounded
+"parse exactly N TLVs" helper both `FeedbagItem` and `UserInfo` now share,
+since both embed this same TLV-*count*-prefixed shape.
+
+Between this and the `UserInfo` fix above, presence and incoming messages
+should now actually work — both were silently starved by a buddy list that
+was never really there. Still to verify for real: does this actually fix
+presence/messages now, and the block list (which reuses the now-fixed
+`FeedbagItem` encoding, so is very likely to have shared bug 2, but hasn't
+been separately confirmed).
+
+## Update: "Bug 2" above was itself wrong — reverted to a 2-byte name length
+
+Added `eprintln!`-based wire logging (`[oscar-rs]` prefix — every incoming
+SNAC's family/subtype/body, every outgoing feedbag insert, both hex-dumped)
+since guessing further without visibility into actual bytes wasn't working.
+First real capture immediately settled the question the "Bug 2" section
+above got wrong: `FeedbagItem`'s name length prefix is **2 bytes**, not the
+1 byte that fix changed it to — the `len_prefix=uint8` reading of Open OSCAR
+Server's source was incorrect (a bad WebFetch summary, not verified against
+actual bytes at the time).
+
+The real captured reply body contained two items back to back — a
+`"Buddies"` group and a `"catmints"` buddy. Both a 1-byte and a 2-byte
+length read `"Buddies"` correctly (its length happens to be small enough
+that the high byte of a `u16` length is `0x00`, making the two encodings
+look identical for that one item — the exact ambiguity that let the wrong
+fix pass a superficial glance). `"catmints"` is what broke the tie: under
+the 1-byte reading, its name decoded as empty with `08` (part of the real
+2-byte length `00 08`) left over as garbage, cascading into nonsense
+`group_id`/`item_id`/`class_id` values for the rest of the item — visible
+directly in the logged output as `(class_id: 25705, name: "", group_id:
+1858, item_id: 30052)`. Under a 2-byte reading, every field of both items
+decodes cleanly, including the trailing 4-byte timestamp landing exactly on
+the end of the body with zero leftover bytes.
+
+That corruption cascaded further than just a bad buddy-list read: since the
+existing `"Buddies"` group didn't match anything recognizable, `group_id()`
+concluded no such group existed yet and tried to *insert a new one* — a
+duplicate the server evidently didn't tolerate, closing the connection
+outright (surfacing as `connection closed` in the UI, and `session actor is
+not running` on the next command once the actor had already torn itself
+down in response).
+
+**The fix:** reverted `FeedbagItem`'s name length back to `u16`/2 bytes.
+Added `oscar-rs/src/feedbag.rs`'s `feedbag_item_parse_all_decodes_a_real_server_reply`
+test using this exact captured body as a permanent ground-truth regression
+test — real bytes from a real server beat a secondhand source-code summary,
+so this is now the test suite's strongest evidence for this struct's shape.
+
+The broader lesson, worth stating plainly: WebFetch-summarized source code
+is a strong *lead*, not a substitute for checking actual wire bytes when
+they're available. Every other fix in the two updates above (the
+`UserInfo` block shape, the `0x06`/`0x07` subtype correction) came from the
+same kind of source lookup and hasn't yet been contradicted by a real
+capture — but per this update, that's "not yet contradicted," not
+"verified," until something like this debug logging confirms it directly.
+
+## Update: messages finally work — a missing `ClientOnline` announcement
+
+With the buddy list actually syncing, retested messaging again. Buddies now
+persist and show up correctly, but sending a message still failed — this
+time with a visible error instead of silence, thanks to the new logging:
+the server replied with a family-0x04 (ICBM) error SNAC, error code `0x0004`.
+
+Checked that code against `wire.ErrorCode*`: `ErrorCodeNotLoggedOn`. Both
+accounts were, in fact, logged in — so this meant the server's *session
+lookup* didn't consider the recipient reachable, despite a live, fully
+authenticated BOS connection.
+
+**The bug:** this client never sent `SNAC_0x01_0x02_OServiceClientOnline`
+("client online", Generic family, subtype `0x02`) — a required post-login
+announcement of which SNAC families/versions the client supports. Checked
+`foodgroup/oservice.go`: the server's handler for this message calls
+`SetSignonComplete()` and is what starts broadcasting presence to buddies.
+Without it, a session sits on an open, authenticated TCP connection
+indefinitely without ever being considered "fully signed on" — invisible to
+buddies, and (per `ErrorCodeNotLoggedOn`) unreachable for messaging, even
+though nothing about the connection itself is wrong. This also plausibly
+explains lingering presence gaps beyond what the `UserInfo` fix alone
+covered — presence broadcasts to buddies are gated on this message too.
+
+**The fix:** `login()` now sends `ClientOnline` immediately after receiving
+"host online," announcing versions for every family this client
+implements (Generic, Locate, BuddyPresence, Messaging, Feedbag) — an
+8-byte `(family, version, tool ID, tool version)` entry per family, back
+to back, no count prefix (confirmed against the struct: a bare
+`[]struct{...}` with no `count_prefix` tag). Both fake-server integration
+tests updated to consume this extra SNAC in the login sequence.
+
+Also worth calling out since it's easy to miss: the *error path itself*
+only became visible because of the `[oscar-rs]` debug logging added the
+update before this one — before that, a rejected send just silently
+"succeeded" from this client's perspective (the SNAC transmits fine over
+TCP; only the server's *reply* carries the failure, and nothing was reading
+or surfacing replies to `send_message` at all). That gap — actions that can
+fail server-side with no client-visible signal — is worth keeping in mind
+for anything not yet wired to check for a reply.
+
+## Update: online status still wasn't showing — screen names aren't case-sensitive
+
+Messages work now, but buddies still showed as offline in both directions.
+The `[oscar-rs]` logs showed presence arrivals actually arriving
+(`family=0x0003 subtype=0x0b`) and decoding cleanly via `UserInfo::parse`
+— so the frame was received and parsed correctly, and the bug had to be in
+what happens *after* that.
+
+**The bug:** the arrival for one account named the buddy `"Catmints"`
+(mixed case), but that same buddy's entry in the local `buddies` list —
+populated from the earlier feedbag-reply capture — was `"catmints"` (all
+lowercase). Every buddy lookup in this codebase (`set_online`, `set_away`,
+`set_warning_level`, the Locate reply handler, `remove_buddy`,
+`add_to_block_list`/`remove_from_block_list`) used a plain Rust `==` on
+screen names. `"catmints" != "Catmints"`, so `.find()` silently came back
+empty and every one of those setters no-op'd — a buddy could be present in
+the list and still never have `is_online` (or `is_away`, or
+`warning_level`, or `away_message`, or `is_blocked`) actually updated.
+
+OSCAR screen names are canonically case- *and* whitespace-insensitive —
+this isn't a server bug or an edge case, it's routine: different parts of
+the protocol have no obligation to agree on which display form (a user's
+own preferred capitalization vs. some normalized storage form) they hand
+back.
+
+**The fix:** added `oscar_rs::client::screen_names_match` (normalizes by
+stripping whitespace and lowercasing, then compares) and replaced every
+screen-name `==`/`!=` across `feedbag.rs` and `locate.rs` with it.
+`set_online` also gained an `eprintln!` for the "no matching buddy found"
+case, so a future mismatch like this one is visible immediately instead of
+silently swallowed. `session_integration.rs`'s presence-arrival test now
+deliberately sends `"BUDDY1"` against a `"Buddy1"` feedbag entry, so this
+exact class of bug has a permanent regression test.
+
+This is the last of the "buddy list looked fine but presence silently
+didn't propagate" family of bugs — between this, the `UserInfo` fix, the
+`FeedbagItem` fixes, and `ClientOnline`, real-server testing has now
+touched every piece of the feedbag/presence/messaging/locate path at least
+once. **Confirmed working end to end against a real Open OSCAR Server**:
+login, buddy add/persist, presence (online/away, both directions), and
+messaging (send and receive). **Still to verify for real**: ICBM warning
+(`send_warning`) and the feedbag block list — the underlying bugs those
+paths shared with everything above are fixed, but neither has been
+separately exercised live yet.
+
+## Update: warning and the block list — one more privacy-mode gap
+
+Warning and blocking both tested live: warning levels update and persist
+correctly, and a blocked buddy stays blocked across logout/login (so
+`FeedbagItem`'s block-list encoding is confirmed good). One real gap
+remained: **messages from a blocked user still got through.**
+
+Checked Open OSCAR Server's relationship-computation SQL: whether the deny
+list is consulted *at all* is gated on a separate privacy-mode preference
+— a `CLASS_PDINFO` (`0x0004`) feedbag item carrying a one-byte `pdMode`
+value (TLV `0x00CA`; `4` = "deny some", i.e. block only who's on the deny
+list). Without that item present, the mode defaults to no enforcement —
+the deny list can be fully populated and still block nobody, which is
+exactly what was observed. This client never created or set it.
+
+**Attempted fix, reverted:** added an `ensure_deny_mode_active` step to
+`add_to_block_list` that found-or-created the account's `CLASS_PDINFO` item
+with `pdMode = 4`. Against a real server this reliably **hard-disconnected
+the connection** — no error reply, no `FeedbagStatus` ack, nothing. Checked
+the server's own systemd journal at the exact moment of disconnect: also
+nothing — no panic, no error, not even a connection-closed line. That
+absence is itself informative: it means there's no way to tell, from
+either side, *why* this specific insert is rejected. Tried a second
+variant (a non-empty `name` field, matching real-client convention, in
+case an empty string was the issue) — same result.
+
+Continuing to guess at undocumented byte-level details with zero
+verification signal (no packet capture, no server log, source code that
+doesn't show an obvious rejection path) risks introducing more bugs than
+it fixes — which is exactly what happened here: blocking *worked*
+(cosmetically, if not fully enforced) before this attempt, and only
+started hard-disconnecting because of it. Reverted `ensure_deny_mode_active`
+entirely; `add_to_block_list`/`remove_from_block_list` are back to their
+previously-verified behavior (block-list membership persists correctly
+across login, per the real-server test earlier in this update).
+
+**Net state:** login, buddy list, presence, messaging, warning, and
+block-list *membership* are all confirmed working live. Block-list
+*enforcement* (actually preventing messages from someone you've blocked)
+remains a known, real gap — the privacy-mode-preference theory above is
+still the most likely explanation, backed by the server's own SQL, but
+implementing it needs an actual packet capture of a real client doing this
+to get the byte format right, the same standard every other fix in this
+project has been held to. Guessing further without that isn't worth the
+risk of breaking working functionality again.
+
+## Update: found it — `item_id` was the actual crash trigger, not the TLV
+
+Open OSCAR Server is itself open source, so instead of guessing further,
+checked its own test suite for a concrete example. `foodgroup/feedbag_test.go`
+has a "set privacy mode" test that inserts a `CLASS_PDINFO` item with
+**everything left at zero/empty defaults** — `item_id: 0`, no name, no
+attributes. That's different from both earlier attempts, which used this
+codebase's usual auto-incremented (non-zero) `item_id`.
+
+Sent a diagnostic probe matching their test exactly (`item_id: 0`, no
+attributes) — no TLV, so no privacy mode actually set by itself, purely a
+test of whether the base insert survives. It did: the server round-tripped
+it cleanly with a `FeedbagStatus` success reply (`0x0000`), the first
+reply of *any* kind this specific item class had ever gotten. That isolates
+`item_id` as the actual problem in both earlier crashes — the `pdMode` TLV
+was never the issue.
+
+**Attempted fix, also reverted:** `ensure_deny_mode_active` came back
+(found-or-updates the account's `CLASS_PDINFO` item), now always using
+`item_id: 0` instead of an auto-incremented one, with the `pdMode` TLV
+attached either via a fresh `INSERT_ITEM` (no local item yet) or an
+`UPDATE_ITEM` on the now-existing bare one from the probe above. Tested
+live — see the next update. Spoiler: still crashes, for a different,
+now conclusively isolated reason.
+
+## Update: conclusively isolated — any TLV on a Pdinfo item crashes this server
+
+The bare `item_id: 0` probe (no attributes) round-tripped cleanly, twice.
+The exact same item shape with **one** TLV attribute attached — tried as
+both `INSERT_ITEM` and `UPDATE_ITEM` — hard-disconnected immediately both
+times, with zero reply of any kind. Same test, only variable changed: this
+conclusively isolates the problem to *attaching any attribute at all* to a
+`CLASS_PDINFO` item, independent of `item_id`, independent of insert vs.
+update, independent of which specific TLV type/value was guessed.
+
+This lines up with something noted earlier and initially treated as a
+minor detail: Open OSCAR Server's own test suite never exercises a
+`Pdinfo` item *with* attributes, only ever a bare one. In hindsight that's
+a real signal, not a coincidence — this may well be a genuine gap in the
+server's own handling of this item class, not a client-side byte-format
+mistake at all. Either way, there's no more guessing left to responsibly
+try: no packet capture available, no working example anywhere in the
+server's own source or tests, and two independent failure modes already
+ruled out by direct experiment.
+
+**Reverted for good this time**: `ensure_deny_mode_active` and everything
+related to it (the `CLASS_PDINFO` constant, the TLV constants) removed
+entirely. `add_to_block_list`/`remove_from_block_list` are back to the
+simple, repeatedly-confirmed-working version: deny-list membership only,
+persists correctly across login, no privacy-mode manipulation attempted.
+
+**Final state of the block list, for now:** membership (add/remove/persist)
+is fully verified working. Enforcement (actually stopping a blocked user's
+messages) is a known, well-diagnosed, *not* client-fixable-by-guessing gap
+— worth raising with the Open OSCAR Server project directly (their
+Discord, or a GitHub issue, are the natural next step) rather than
+continuing to probe blind from this side.

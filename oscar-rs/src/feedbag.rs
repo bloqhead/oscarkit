@@ -12,12 +12,19 @@
 
 use std::collections::HashMap;
 
-use crate::client::{OscarError, OscarSession};
-use crate::snac::{Snac, SnacFamily, SnacHeader, Tlv};
+use crate::client::{screen_names_match, OscarError, OscarSession};
+use crate::snac::{Snac, SnacFamily, SnacHeader, Tlv, UserInfo};
 
+// Subtype numbers confirmed against Open OSCAR Server's wire.Feedbag*
+// constants — REPLY and USE were both off by one (0x05/0x06 instead of the
+// real 0x06/0x07). 0x05 is actually a *different* client-to-server message
+// (FeedbagQueryIfModified) this codebase never sends, so the old REPLY
+// match arm silently never fired against a real server: every real feedbag
+// reply fell through to the default no-op case, and the buddy list never
+// synced from a real server at all.
 const QUERY: u16 = 0x04; // client: "send me my whole list"
-const REPLY: u16 = 0x05; // server: here's your list
-const USE: u16 = 0x06; // client: "ack, I've got it, proceed"
+const REPLY: u16 = 0x06; // server: here's your list
+const USE: u16 = 0x07; // client: "ack, I've got it, proceed"
 const INSERT_ITEM: u16 = 0x08; // client: add buddy/group
 const DELETE_ITEM: u16 = 0x0A;
 const STATUS: u16 = 0x0E; // server: ack of insert/update/delete
@@ -26,13 +33,22 @@ const STATUS: u16 = 0x0E; // server: ack of insert/update/delete
 /// metadata items (permit/deny lists, visibility prefs) — shares this same
 /// wire structure. `class_id` is what tells you which kind you're looking
 /// at.
+///
+/// Confirmed against Open OSCAR Server's `wire.FeedbagItem`:
+/// Name length prefix is a plain **2-byte** (`u16`) length — confirmed
+/// empirically from a real feedbag reply's raw bytes (`oscar:"len_prefix=uint8"`
+/// was an earlier, wrong reading of Open OSCAR Server's source; a second
+/// item's name only decoded correctly, matching actual buddy-list content,
+/// once read as `u16`, so this went with the byte-level evidence over the
+/// secondhand source summary). `attributes` is a `TLVBlock` (a TLV *count*
+/// prefix + that many TLVs), not a raw byte-length-prefixed blob.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FeedbagItem {
     pub name: String,
     pub group_id: u16,
     pub item_id: u16,
     pub class_id: u16,
-    pub attributes: Vec<u8>, // raw TLV block; parse with Tlv::parse_all if you need specific fields
+    pub attributes: Vec<Tlv>,
 }
 
 impl FeedbagItem {
@@ -45,14 +61,16 @@ impl FeedbagItem {
 
     pub fn encode(&self) -> Vec<u8> {
         let name_bytes = self.name.as_bytes();
-        let mut out = Vec::with_capacity(10 + name_bytes.len() + self.attributes.len());
+        let mut out = Vec::with_capacity(10 + name_bytes.len());
         out.extend_from_slice(&(name_bytes.len() as u16).to_be_bytes());
         out.extend_from_slice(name_bytes);
         out.extend_from_slice(&self.group_id.to_be_bytes());
         out.extend_from_slice(&self.item_id.to_be_bytes());
         out.extend_from_slice(&self.class_id.to_be_bytes());
         out.extend_from_slice(&(self.attributes.len() as u16).to_be_bytes());
-        out.extend_from_slice(&self.attributes);
+        for tlv in &self.attributes {
+            out.extend(tlv.encode());
+        }
         out
     }
 
@@ -80,12 +98,10 @@ impl FeedbagItem {
         let group_id = read_u16(data, &mut index)?;
         let item_id = read_u16(data, &mut index)?;
         let class_id = read_u16(data, &mut index)?;
-        let attr_len = read_u16(data, &mut index)? as usize;
-        if index + attr_len > data.len() {
-            return None;
-        }
-        let attributes = data[index..index + attr_len].to_vec();
-        index += attr_len;
+        let attr_count = read_u16(data, &mut index)? as usize;
+        let (attr_tlvs, consumed) = Tlv::parse_n(&data[index..], attr_count);
+        let attributes: Vec<Tlv> = attr_tlvs.into_iter().map(|(tlv_type, value)| Tlv { tlv_type, value }).collect();
+        index += consumed;
 
         Some((FeedbagItem { name, group_id, item_id, class_id, attributes }, index))
     }
@@ -144,7 +160,9 @@ impl OscarSession {
 
         let item = FeedbagItem { name: screen_name.to_string(), group_id, item_id, class_id: FeedbagItem::CLASS_BUDDY, attributes: Vec::new() };
         let header = SnacHeader { family: SnacFamily::Feedbag.as_u16(), subtype: INSERT_ITEM, flags: 0, request_id: self.next_request_id() };
-        self.bos_connection.send_snac(&Snac { header, body: item.encode() }).await?;
+        let body = item.encode();
+        eprintln!("[oscar-rs] -> insert buddy {item:?}: {}", crate::snac::hex_dump(&body));
+        self.bos_connection.send_snac(&Snac { header, body }).await?;
 
         // Optimistic local update — reconciled for real once 0x0E status comes back.
         self.buddies.push(Buddy {
@@ -160,21 +178,37 @@ impl OscarSession {
     }
 
     pub async fn remove_buddy(&mut self, screen_name: &str) -> Result<(), OscarError> {
-        let Some(existing) = self.feedbag_items.iter().find(|i| i.class_id == FeedbagItem::CLASS_BUDDY && i.name == screen_name).cloned() else {
+        let Some(existing) = self.feedbag_items.iter().find(|i| i.class_id == FeedbagItem::CLASS_BUDDY && screen_names_match(&i.name, screen_name)).cloned() else {
             return Ok(());
         };
 
         let header = SnacHeader { family: SnacFamily::Feedbag.as_u16(), subtype: DELETE_ITEM, flags: 0, request_id: self.next_request_id() };
         self.bos_connection.send_snac(&Snac { header, body: existing.encode() }).await?;
-        self.buddies.retain(|b| b.screen_name != screen_name);
+        self.buddies.retain(|b| !screen_names_match(&b.screen_name, screen_name));
         Ok(())
     }
 
     /// Adds a screen name to your block (deny) list — the OSCAR mechanism
     /// behind "blocking" someone: they can no longer see your presence or
     /// message you. Unlike buddies, block-list entries need no group.
+    ///
+    /// Being *on* the deny list isn't provably sufficient by itself — Open
+    /// OSCAR Server's relationship-computation SQL gates deny-list
+    /// enforcement behind a separate privacy-mode preference (a
+    /// `CLASS_PDINFO` item). This client does not set it: a bare
+    /// `CLASS_PDINFO` item with `item_id: 0` and no attributes round-trips
+    /// cleanly against a real server, but the exact same item with a
+    /// `pdMode` TLV attached — via `INSERT_ITEM` *or* `UPDATE_ITEM`, tried
+    /// both ways — hard-disconnects the connection immediately, with zero
+    /// signal from the server either time. That isolates the problem to
+    /// attaching *any* attribute to this item class, not the specific TLV
+    /// guess; Open OSCAR Server's own test suite never exercises a
+    /// `Pdinfo` item with attributes either, so this may be an actual gap
+    /// in the server rather than something guessing more bytes would fix.
+    /// Deny-list membership itself is unaffected and confirmed working —
+    /// this is specifically about the separate enforcement toggle.
     pub async fn add_to_block_list(&mut self, screen_name: &str) -> Result<(), OscarError> {
-        if self.feedbag_items.iter().any(|i| i.class_id == FeedbagItem::CLASS_DENY && i.name == screen_name) {
+        if self.feedbag_items.iter().any(|i| i.class_id == FeedbagItem::CLASS_DENY && screen_names_match(&i.name, screen_name)) {
             return Ok(());
         }
         let item_id = self.next_feedbag_item_id();
@@ -182,20 +216,20 @@ impl OscarSession {
         let header = SnacHeader { family: SnacFamily::Feedbag.as_u16(), subtype: INSERT_ITEM, flags: 0, request_id: self.next_request_id() };
         self.bos_connection.send_snac(&Snac { header, body: item.encode() }).await?;
         self.feedbag_items.push(item);
-        if let Some(buddy) = self.buddies.iter_mut().find(|b| b.screen_name == screen_name) {
+        if let Some(buddy) = self.buddies.iter_mut().find(|b| screen_names_match(&b.screen_name, screen_name)) {
             buddy.is_blocked = true;
         }
         Ok(())
     }
 
     pub async fn remove_from_block_list(&mut self, screen_name: &str) -> Result<(), OscarError> {
-        let Some(existing) = self.feedbag_items.iter().find(|i| i.class_id == FeedbagItem::CLASS_DENY && i.name == screen_name).cloned() else {
+        let Some(existing) = self.feedbag_items.iter().find(|i| i.class_id == FeedbagItem::CLASS_DENY && screen_names_match(&i.name, screen_name)).cloned() else {
             return Ok(());
         };
         let header = SnacHeader { family: SnacFamily::Feedbag.as_u16(), subtype: DELETE_ITEM, flags: 0, request_id: self.next_request_id() };
         self.bos_connection.send_snac(&Snac { header, body: existing.encode() }).await?;
-        self.feedbag_items.retain(|i| !(i.class_id == FeedbagItem::CLASS_DENY && i.name == screen_name));
-        if let Some(buddy) = self.buddies.iter_mut().find(|b| b.screen_name == screen_name) {
+        self.feedbag_items.retain(|i| !(i.class_id == FeedbagItem::CLASS_DENY && screen_names_match(&i.name, screen_name)));
+        if let Some(buddy) = self.buddies.iter_mut().find(|b| screen_names_match(&b.screen_name, screen_name)) {
             buddy.is_blocked = false;
         }
         Ok(())
@@ -214,32 +248,39 @@ impl OscarSession {
     }
 
     /// Family 0x03 (Buddy) — presence notifications, separate from the
-    /// roster itself.
+    /// roster itself. Both arrival and departure bodies are a `UserInfo`
+    /// block (confirmed against Open OSCAR Server's `wire.TLVUserInfo`) —
+    /// *not* a bare name followed by plain TLVs, which is what this used to
+    /// assume before that got checked against a real server.
     pub(crate) fn handle_presence_frame(&mut self, snac: &Snac) {
         match snac.header.subtype {
             0x0B => {
-                // buddy arrived (online) — body also carries their current status flags
-                if let Some((name, remainder)) = parse_screen_name_buf_with_remainder(&snac.body) {
-                    let tlvs = Tlv::parse_all(remainder);
-                    // User status flags, TLV 0x0C in most implementations'
-                    // arrival payload. Bit 0x0020 is the conventional "away"
-                    // flag across OSCAR clients.
-                    let is_away = tlvs
-                        .get(&0x0C)
+                // buddy arrived (online) — the UserInfo block carries their
+                // current status flags and warning level directly.
+                if let Some((info, _)) = UserInfo::parse(&snac.body) {
+                    // Away can show up in either of two places depending on
+                    // server: TLV 0x01 "user flags" (u16, bit 0x0020 = away —
+                    // the classic cross-client convention) or TLV 0x06
+                    // "status" (u32, bit 0x00000001 = away). Check both.
+                    let away_via_flags = info
+                        .tlvs
+                        .get(&0x01)
                         .map(|data| data.len() >= 2 && u16::from_be_bytes([data[0], data[1]]) & 0x0020 != 0)
                         .unwrap_or(false);
-                    // Warning ("evil") level, TLV 0x0A, same permille (0-1000)
-                    // scale as the ICBM warning reply in messaging.rs.
-                    let warning_level = tlvs.get(&0x0A).map(|data| if data.len() >= 2 { u16::from_be_bytes([data[0], data[1]]) } else { 0 }).unwrap_or(0);
-                    self.set_online(&name, true);
-                    self.set_away(&name, is_away);
-                    self.set_warning_level(&name, warning_level);
+                    let away_via_status = info
+                        .tlvs
+                        .get(&0x06)
+                        .map(|data| data.len() >= 4 && u32::from_be_bytes([data[0], data[1], data[2], data[3]]) & 0x0000_0001 != 0)
+                        .unwrap_or(false);
+                    self.set_online(&info.screen_name, true);
+                    self.set_away(&info.screen_name, away_via_flags || away_via_status);
+                    self.set_warning_level(&info.screen_name, info.warning_level);
                 }
             }
             0x0C => {
-                // buddy departed (offline)
-                if let Some(name) = parse_screen_name_buf(&snac.body) {
-                    self.set_online(&name, false);
+                // buddy departed (offline) — same UserInfo shape, we only need the name.
+                if let Some((info, _)) = UserInfo::parse(&snac.body) {
+                    self.set_online(&info.screen_name, false);
                 }
             }
             _ => {}
@@ -258,6 +299,14 @@ impl OscarSession {
         }
         let item_count = u16::from_be_bytes([body[1], body[2]]) as usize;
         let items = FeedbagItem::parse_all(&body[3..]);
+        eprintln!(
+            "[oscar-rs] feedbag reply: server says {item_count} items, parsed {} — {:?}",
+            items.len(),
+            items.iter().map(|i| (i.class_id, &i.name, i.group_id, i.item_id)).collect::<Vec<_>>()
+        );
+        if items.len() != item_count {
+            eprintln!("[oscar-rs] *** item count mismatch — parsing likely desynced partway through; raw body: {}", crate::snac::hex_dump(body));
+        }
 
         // Build group-ID -> name lookup first, since buddy items only carry a groupID.
         let mut group_names: HashMap<u16, String> = HashMap::new();
@@ -294,31 +343,34 @@ impl OscarSession {
     }
 
     fn set_online(&mut self, screen_name: &str, online: bool) {
-        if let Some(buddy) = self.buddies.iter_mut().find(|b| b.screen_name == screen_name) {
+        if let Some(buddy) = self.buddies.iter_mut().find(|b| screen_names_match(&b.screen_name, screen_name)) {
             buddy.is_online = online;
             if !online {
                 // Away status is meaningless once offline — reset so stale
                 // state doesn't linger and confuse the UI on their next arrival.
                 buddy.is_away = false;
             }
+        } else {
+            eprintln!("[oscar-rs] presence update for {screen_name:?} but no matching buddy found locally");
         }
     }
 
     fn set_away(&mut self, screen_name: &str, away: bool) {
-        if let Some(buddy) = self.buddies.iter_mut().find(|b| b.screen_name == screen_name) {
+        if let Some(buddy) = self.buddies.iter_mut().find(|b| screen_names_match(&b.screen_name, screen_name)) {
             buddy.is_away = away;
         }
     }
 
     /// Also called from `messaging.rs`'s ICBM warning-reply handler, hence `pub(crate)`.
     pub(crate) fn set_warning_level(&mut self, screen_name: &str, level: u16) {
-        if let Some(buddy) = self.buddies.iter_mut().find(|b| b.screen_name == screen_name) {
+        if let Some(buddy) = self.buddies.iter_mut().find(|b| screen_names_match(&b.screen_name, screen_name)) {
             buddy.warning_level = level;
         }
     }
 
     async fn group_id(&mut self, name: &str) -> Result<u16, OscarError> {
-        if let Some(existing) = self.feedbag_items.iter().find(|i| i.class_id == FeedbagItem::CLASS_GROUP && i.name == name) {
+        if let Some(existing) = self.feedbag_items.iter().find(|i| i.class_id == FeedbagItem::CLASS_GROUP && screen_names_match(&i.name, name)) {
+            eprintln!("[oscar-rs] group {name:?} already exists locally (item_id={})", existing.item_id);
             return Ok(existing.item_id);
         }
         // New group: create it too. Real clients send both the group item
@@ -327,34 +379,12 @@ impl OscarSession {
         let new_group_id = self.next_feedbag_item_id();
         let group_item = FeedbagItem { name: name.to_string(), group_id: 0, item_id: new_group_id, class_id: FeedbagItem::CLASS_GROUP, attributes: Vec::new() };
         let header = SnacHeader { family: SnacFamily::Feedbag.as_u16(), subtype: INSERT_ITEM, flags: 0, request_id: self.next_request_id() };
-        self.bos_connection.send_snac(&Snac { header, body: group_item.encode() }).await?;
+        let body = group_item.encode();
+        eprintln!("[oscar-rs] -> insert group {group_item:?}: {}", crate::snac::hex_dump(&body));
+        self.bos_connection.send_snac(&Snac { header, body }).await?;
         self.feedbag_items.push(group_item);
         Ok(new_group_id)
     }
-}
-
-/// Family 0x03 arrival/departure bodies lead with the same BUF pattern
-/// (1-byte length + name bytes, no type field) as ICBM.
-fn parse_screen_name_buf(body: &[u8]) -> Option<String> {
-    let &first = body.first()?;
-    let length = first as usize;
-    if body.len() < 1 + length {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&body[1..1 + length]).to_string())
-}
-
-/// Same as above, but also returns whatever bytes follow the name — the
-/// arrival notification's TLV block, which callers may want to inspect for
-/// status flags, warning level, etc.
-fn parse_screen_name_buf_with_remainder(body: &[u8]) -> Option<(String, &[u8])> {
-    let &first = body.first()?;
-    let length = first as usize;
-    if body.len() < 1 + length {
-        return None;
-    }
-    let name = String::from_utf8_lossy(&body[1..1 + length]).to_string();
-    Some((name, &body[1 + length..]))
 }
 
 #[cfg(test)]
@@ -363,11 +393,39 @@ mod tests {
 
     #[test]
     fn feedbag_item_round_trips() {
-        let item = FeedbagItem { name: "MyBuddy".to_string(), group_id: 1, item_id: 5, class_id: FeedbagItem::CLASS_BUDDY, attributes: vec![0xAA, 0xBB] };
+        let item = FeedbagItem {
+            name: "MyBuddy".to_string(),
+            group_id: 1,
+            item_id: 5,
+            class_id: FeedbagItem::CLASS_BUDDY,
+            attributes: vec![Tlv::new(0x01, vec![0xAA, 0xBB])],
+        };
         let encoded = item.encode();
         let (parsed, consumed) = FeedbagItem::parse(&encoded).unwrap();
         assert_eq!(consumed, encoded.len());
         assert_eq!(parsed, item);
+    }
+
+    /// A real feedbag-reply body, captured (via debug logging) from an
+    /// actual Open OSCAR Server instance. Ground truth for the wire format —
+    /// this is what caught the previous, wrong "1-byte name length" fix:
+    /// under that reading, the second item's name decoded as empty instead
+    /// of "catmints", with the real length byte misread as leftover data.
+    #[test]
+    fn feedbag_item_parse_all_decodes_a_real_server_reply() {
+        let body: &[u8] = &[
+            0x00, 0x00, 0x02, 0x00, 0x07, 0x42, 0x75, 0x64, 0x64, 0x69, 0x65, 0x73, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x08, 0x63, 0x61, 0x74, 0x6d, 0x69, 0x6e, 0x74, 0x73, 0x00,
+            0x02, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x6a, 0x5d, 0x22, 0xd8,
+        ];
+        // First 3 bytes are version + item count, same slicing handle_feedbag_reply does.
+        let items = FeedbagItem::parse_all(&body[3..]);
+        assert_eq!(
+            items,
+            vec![
+                FeedbagItem { name: "Buddies".to_string(), group_id: 0, item_id: 2, class_id: FeedbagItem::CLASS_GROUP, attributes: Vec::new() },
+                FeedbagItem { name: "catmints".to_string(), group_id: 2, item_id: 3, class_id: FeedbagItem::CLASS_BUDDY, attributes: Vec::new() },
+            ]
+        );
     }
 
     #[test]
@@ -381,14 +439,4 @@ mod tests {
         assert_eq!(items, vec![a, b]);
     }
 
-    #[test]
-    fn parse_screen_name_buf_with_remainder_splits_correctly() {
-        let mut body = vec![3u8];
-        body.extend_from_slice(b"Bob");
-        body.extend_from_slice(&[0xDE, 0xAD]);
-
-        let (name, remainder) = parse_screen_name_buf_with_remainder(&body).unwrap();
-        assert_eq!(name, "Bob");
-        assert_eq!(remainder, &[0xDE, 0xAD]);
-    }
 }

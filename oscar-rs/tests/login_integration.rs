@@ -62,6 +62,14 @@ async fn serve_bos(mut conn: FlapConnection) {
         body: Vec::new(),
     };
     conn.send_snac(&reply).await.unwrap();
+
+    // Client announces "client online" (Generic family, subtype 0x02) right
+    // after host-online — read it so the connection doesn't drop out from
+    // under the client mid-send.
+    let client_online = conn.read_frame().await.unwrap().unwrap();
+    let snac = Snac::parse(&client_online.payload).unwrap();
+    assert_eq!(snac.header.family, SnacFamily::Generic.as_u16());
+    assert_eq!(snac.header.subtype, 0x02);
 }
 
 #[tokio::test]

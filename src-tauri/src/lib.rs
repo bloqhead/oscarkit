@@ -20,6 +20,7 @@ pub fn run() {
             commands::send_warning,
             commands::add_to_block_list,
             commands::remove_from_block_list,
+            commands::logout,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -86,3 +86,15 @@ pub async fn add_to_block_list(state: State<'_, SessionState>, screen_name: Stri
 pub async fn remove_from_block_list(state: State<'_, SessionState>, screen_name: String) -> Result<(), String> {
     dispatch(state, |reply| SessionCommand::RemoveFromBlockList { screen_name, reply }).await
 }
+
+/// Ends the current session. Clearing the stored sender is enough to tear
+/// everything down: the actor's next `cmd_rx.recv()` sees all senders
+/// dropped and returns `None`, so its loop breaks, dropping `OscarSession`
+/// (closing the write half); the reader task's next send over `frame_tx`
+/// then fails (the actor's `frame_rx` dropped with it), so it breaks too and
+/// drops the read half, fully closing the connection. No explicit shutdown
+/// signal needed.
+#[tauri::command]
+pub fn logout(state: State<'_, SessionState>) {
+    *state.0.lock().unwrap() = None;
+}

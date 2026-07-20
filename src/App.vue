@@ -39,6 +39,8 @@ const snapshot = ref<SessionSnapshot | null>(null);
 const recipient = ref("");
 const messageText = ref("");
 const awayText = ref("");
+const newBuddyName = ref("");
+const newBuddyGroup = ref("Buddies");
 
 listen<SessionSnapshot>("session-update", (event) => {
   snapshot.value = event.payload;
@@ -113,6 +115,25 @@ async function toggleBlock(buddy: Buddy) {
     errorMessage.value = String(e);
   }
 }
+
+async function addBuddy() {
+  try {
+    await invoke("add_buddy", { screenName: newBuddyName.value, groupName: newBuddyGroup.value || "Buddies" });
+    newBuddyName.value = "";
+  } catch (e) {
+    errorMessage.value = String(e);
+  }
+}
+
+async function logout() {
+  try {
+    await invoke("logout");
+  } catch (e) {
+    errorMessage.value = String(e);
+  }
+  loggedIn.value = false;
+  snapshot.value = null;
+}
 </script>
 
 <template>
@@ -129,7 +150,14 @@ async function toggleBlock(buddy: Buddy) {
     </form>
 
     <div v-else-if="snapshot">
-      <h2>Signed on as {{ snapshot.screen_name }}</h2>
+      <h2>Signed on as {{ snapshot.screen_name }} <button @click="logout">Logout</button></h2>
+
+      <section>
+        <h3>Add a buddy</h3>
+        <input v-model="newBuddyName" placeholder="Screen name" @keydown.enter="addBuddy" />
+        <input v-model="newBuddyGroup" placeholder="Group (default: Buddies)" @keydown.enter="addBuddy" />
+        <button @click="addBuddy">Add</button>
+      </section>
 
       <section>
         <h3>Away message</h3>

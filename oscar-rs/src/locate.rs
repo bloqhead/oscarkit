@@ -10,8 +10,8 @@
 //! and broadcasts it to your buddies automatically — you don't separately
 //! announce "I'm away" beyond setting the message itself.
 
-use crate::client::{OscarError, OscarSession};
-use crate::snac::{Snac, SnacFamily, SnacHeader, Tlv};
+use crate::client::{screen_names_match, OscarError, OscarSession};
+use crate::snac::{Snac, SnacFamily, SnacHeader, Tlv, UserInfo};
 
 const SET_INFO: u16 = 0x04; // client: set my profile/away message
 const USER_INFO_QUERY: u16 = 0x05; // client: "tell me about this buddy"
@@ -20,6 +20,10 @@ const USER_INFO_REPLY: u16 = 0x06; // server: here's their info
 // TLV types used inside both SET_INFO (outgoing) and USER_INFO_REPLY (incoming).
 const AWAY_ENCODING: u16 = 0x03;
 const AWAY_TEXT: u16 = 0x04;
+
+// Request-type bitmask for USER_INFO_QUERY (confirmed against Open OSCAR
+// Server's wire.LocateType* constants — NOT a TLV, a raw field, see below).
+const REQUEST_TYPE_UNAVAILABLE: u16 = 0x0002; // "give me their away message"
 
 impl OscarSession {
     /// Sets (or clears, if `None`) your away message. This is the *only*
@@ -46,12 +50,18 @@ impl OscarSession {
 
     /// Requests a buddy's current profile/away message. Reply arrives async
     /// via `handle_locate_frame` and updates the matching entry in `buddies`.
+    ///
+    /// Wire format confirmed against Open OSCAR Server's
+    /// `wire.SNAC_0x02_0x05_LocateUserInfoQuery`: this is *not* TLVs at
+    /// all — a raw 2-byte request-type bitmask comes first, then a BUF
+    /// screen name. (The previous version got both the framing and the
+    /// requested bit wrong — it TLV-wrapped both fields and asked for
+    /// `0x0001`, the *profile* bit, not `0x0002`, the away-message one.)
     pub async fn request_user_info(&mut self, screen_name: &str) -> Result<(), OscarError> {
-        let mut body = Vec::new();
-        body.extend(Tlv::new(0x01, screen_name.as_bytes().to_vec()).encode());
-        // Request flags bitmask — 0x0001 asks for away message specifically.
-        // (Profile text, capabilities, etc. have their own bits; add as needed.)
-        body.extend(Tlv::new(0x02, 0x0001u16.to_be_bytes().to_vec()).encode());
+        let mut body = REQUEST_TYPE_UNAVAILABLE.to_be_bytes().to_vec();
+        let name_bytes = screen_name.as_bytes();
+        body.push(name_bytes.len() as u8);
+        body.extend_from_slice(name_bytes);
 
         let header = SnacHeader { family: SnacFamily::Locate.as_u16(), subtype: USER_INFO_QUERY, flags: 0, request_id: self.next_request_id() };
         self.bos_connection.send_snac(&Snac { header, body }).await?;
@@ -59,24 +69,25 @@ impl OscarSession {
     }
 
     /// Family 0x02 (Locate) frame dispatch — called from `handle_next_frame`.
+    ///
+    /// The reply (`wire.SNAC_0x02_0x06_LocateUserInfoReply`) is a `UserInfo`
+    /// block (name + raw warning level + TLV count + TLVs — see
+    /// `snac::UserInfo`) followed by a *separate* plain TLV run carrying the
+    /// actual profile/away-message data. Previously this assumed the name
+    /// was directly followed by that second TLV run, which — same bug class
+    /// as the presence and incoming-message parsing — silently corrupted
+    /// the offset once a real server was involved.
     pub(crate) fn handle_locate_frame(&mut self, snac: &Snac) {
         if snac.header.subtype != USER_INFO_REPLY {
             return;
         }
 
-        // Layout: BUF screen name (1-byte length + chars), then a TLV block
-        // with the same profile/away TLVs used in SET_INFO.
-        let Some(&first) = snac.body.first() else { return };
-        let name_length = first as usize;
-        if snac.body.len() < 1 + name_length {
-            return;
-        }
-        let screen_name = String::from_utf8_lossy(&snac.body[1..1 + name_length]).to_string();
+        let Some((info, consumed)) = UserInfo::parse(&snac.body) else { return };
 
-        let tlvs = Tlv::parse_all(&snac.body[1 + name_length..]);
+        let tlvs = Tlv::parse_all(&snac.body[consumed..]);
         let away_text = tlvs.get(&AWAY_TEXT).map(|v| String::from_utf8_lossy(v).to_string());
 
-        if let Some(buddy) = self.buddies.iter_mut().find(|b| b.screen_name == screen_name) {
+        if let Some(buddy) = self.buddies.iter_mut().find(|b| screen_names_match(&b.screen_name, &info.screen_name)) {
             buddy.away_message = away_text.filter(|t| !t.is_empty());
         }
     }

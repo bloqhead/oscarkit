@@ -14,7 +14,7 @@ use crate::feedbag::{Buddy, FeedbagItem};
 use crate::flap::{FlapChannel, FlapFrame};
 use crate::messaging::IncomingIm;
 use crate::server_address::ServerAddress;
-use crate::snac::{Snac, SnacFamily, SnacHeader, Tlv};
+use crate::snac::{hex_dump, Snac, SnacFamily, SnacHeader, Tlv};
 
 #[derive(Debug, thiserror::Error)]
 pub enum OscarError {
@@ -92,6 +92,22 @@ impl RequestIdCounter {
     }
 }
 
+/// OSCAR screen names are canonically case- and whitespace-insensitive —
+/// confirmed the hard way: a real presence arrival named a buddy
+/// `"Catmints"` while that same buddy's feedbag-list entry (what actually
+/// populated `OscarSession::buddies`) was `"catmints"`. A plain `==` on
+/// screen names — used throughout `feedbag.rs`/`locate.rs` to match an
+/// incoming SNAC's screen name against the local buddy list — silently
+/// fails to find the buddy whenever the two sides disagree on casing,
+/// which is routine, not an edge case: presence/warning/locate replies and
+/// feedbag-list entries have no guarantee of using the same display form.
+pub(crate) fn screen_names_match(a: &str, b: &str) -> bool {
+    fn normalize(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).collect()
+    }
+    normalize(a) == normalize(b)
+}
+
 impl OscarSession {
     pub(crate) fn next_request_id(&mut self) -> u32 {
         self.ids.next()
@@ -138,7 +154,25 @@ impl OscarSession {
         if frame.channel != FlapChannel::Data {
             return Ok(());
         }
-        let Some(snac) = Snac::parse(&frame.payload) else { return Ok(()) };
+        let Some(snac) = Snac::parse(&frame.payload) else {
+            eprintln!("[oscar-rs] dropped an unparseable FLAP data frame ({} bytes)", frame.payload.len());
+            return Ok(());
+        };
+
+        eprintln!(
+            "[oscar-rs] <- family=0x{:04x} subtype=0x{:02x} body={} bytes: {}",
+            snac.header.family,
+            snac.header.subtype,
+            snac.body.len(),
+            hex_dump(&snac.body)
+        );
+
+        // Family 0x01 (Generic) subtype 0x01 is the server's catch-all
+        // "here's why I'm about to close/refuse this" error SNAC — very
+        // relevant when tracking down an unexpected disconnect.
+        if snac.header.family == SnacFamily::Generic.as_u16() && snac.header.subtype == 0x01 {
+            eprintln!("[oscar-rs] *** server sent a Generic error SNAC: {}", hex_dump(&snac.body));
+        }
 
         match SnacFamily::from_u16(snac.header.family) {
             Some(SnacFamily::Messaging) => match snac.header.subtype {
@@ -153,7 +187,7 @@ impl OscarSession {
             Some(SnacFamily::Feedbag) => self.handle_feedbag_frame(&snac).await?,
             Some(SnacFamily::BuddyPresence) => self.handle_presence_frame(&snac),
             Some(SnacFamily::Locate) => self.handle_locate_frame(&snac),
-            _ => {}
+            other => eprintln!("[oscar-rs] no handler for family {other:?} (0x{:04x}) — ignored", snac.header.family),
         }
         Ok(())
     }
@@ -284,6 +318,26 @@ pub async fn login(server: &ServerAddress, screen_name: &str, password: &str) ->
         }
     }
 
+    // Announce "client online" (Generic family, subtype 0x02) — a list of
+    // every SNAC family/version this client supports. Confirmed against
+    // Open OSCAR Server's foodgroup/oservice.go: the server doesn't
+    // consider sign-on complete until this arrives (it's what calls
+    // SetSignonComplete() and starts broadcasting presence to buddies).
+    // Skipping it leaves the TCP session alive but invisible — buddies
+    // never see you online, and messages to/from you fail server-side with
+    // "not logged on" even though you're genuinely connected. No count
+    // prefix: just that many 8-byte (family, version, tool ID, tool
+    // version) entries back to back, filling the rest of the SNAC body.
+    let mut client_online_body = Vec::new();
+    for family in [SnacFamily::Generic, SnacFamily::Locate, SnacFamily::BuddyPresence, SnacFamily::Messaging, SnacFamily::Feedbag] {
+        client_online_body.extend_from_slice(&family.as_u16().to_be_bytes());
+        client_online_body.extend_from_slice(&1u16.to_be_bytes()); // version
+        client_online_body.extend_from_slice(&0u16.to_be_bytes()); // tool ID
+        client_online_body.extend_from_slice(&0u16.to_be_bytes()); // tool version
+    }
+    let header = SnacHeader { family: SnacFamily::Generic.as_u16(), subtype: 0x02, flags: 0, request_id: ids.next() };
+    bos.send_snac(&Snac { header, body: client_online_body }).await?;
+
     let (bos_reader, bos_writer) = bos.into_split();
     let mut session = OscarSession {
         bos_connection: bos_writer,
@@ -309,6 +363,14 @@ pub async fn login(server: &ServerAddress, screen_name: &str, password: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screen_names_match_ignores_case_and_whitespace() {
+        assert!(screen_names_match("Catmints", "catmints"));
+        assert!(screen_names_match("Screen Name", "screenname"));
+        assert!(screen_names_match("SAME", "SAME"));
+        assert!(!screen_names_match("Catmints", "Lyrix18"));
+    }
 
     #[test]
     fn roast_password_is_deterministic() {

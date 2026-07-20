@@ -13,4 +13,4 @@ pub use feedbag::{Buddy, FeedbagItem};
 pub use flap::{FlapChannel, FlapFrame};
 pub use messaging::IncomingIm;
 pub use server_address::{ServerAddress, ServerAddressError};
-pub use snac::{Snac, SnacFamily, SnacHeader, Tlv};
+pub use snac::{Snac, SnacFamily, SnacHeader, Tlv, UserInfo};

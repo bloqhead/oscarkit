@@ -14,25 +14,33 @@ const { currentScreen } = useSession();
 <template>
   <div class="app-shell">
     <WindowControls />
-    <div class="phone-frame">
-      <SignOnScreen v-if="currentScreen === 'signon'" />
-      <BuddyListScreen v-else-if="currentScreen === 'buddylist'" />
-      <ImScreen v-else-if="currentScreen === 'im'" />
-      <BuddyInfoScreen v-else-if="currentScreen === 'info'" />
-      <AwayMessageScreen v-else-if="currentScreen === 'away'" />
-      <PreferencesScreen v-else-if="currentScreen === 'preferences'" />
+    <div class="frame-wrap">
+      <div class="phone-frame">
+        <SignOnScreen v-if="currentScreen === 'signon'" />
+        <BuddyListScreen v-else-if="currentScreen === 'buddylist'" />
+        <ImScreen v-else-if="currentScreen === 'im'" />
+        <BuddyInfoScreen v-else-if="currentScreen === 'info'" />
+        <AwayMessageScreen v-else-if="currentScreen === 'away'" />
+        <PreferencesScreen v-else-if="currentScreen === 'preferences'" />
+      </div>
     </div>
   </div>
 </template>
 
 <style scoped>
 .app-shell {
-  position: relative;
   height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: #2b2b2b;
+}
+
+.frame-wrap {
+  flex: 1;
+  min-height: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: #2b2b2b;
 }
 
 .phone-frame {

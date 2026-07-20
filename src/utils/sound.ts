@@ -12,14 +12,26 @@ export type SoundEvent = keyof typeof SOUND_PATHS;
 const audioCache: Partial<Record<SoundEvent, HTMLAudioElement>> = {};
 
 function getAudio(event: SoundEvent): HTMLAudioElement {
-  return audioCache[event] ?? (audioCache[event] = new Audio(SOUND_PATHS[event]));
+  if (audioCache[event]) return audioCache[event];
+  const audio = new Audio(SOUND_PATHS[event]);
+  // Decode/network failures surface here (the media element's own error
+  // event), separately from — and often instead of — a play() rejection.
+  audio.addEventListener('error', () => {
+    console.error(`[sound] "${event}" (${SOUND_PATHS[event]}) failed to load:`, audio.error);
+  });
+  audioCache[event] = audio;
+  return audio;
 }
 
 export function playSound(event: SoundEvent): void {
   const audio = getAudio(event);
   audio.currentTime = 0;
-  // Decorative — a blocked/failed playback shouldn't ever surface as an error.
-  audio.play().catch(() => {});
+  // Decorative — a blocked/failed playback shouldn't ever surface to the
+  // user as an error toast, but log it: WebKitGTK forwards console
+  // messages to stderr when the app is run from a terminal, which is the
+  // only way to see *why* playback failed (autoplay policy vs. missing
+  // codec vs. a bad asset path all fail silently otherwise).
+  audio.play().catch((e) => console.error(`[sound] "${event}" (${SOUND_PATHS[event]}) failed to play:`, e));
 }
 
 // WebKitGTK (the Linux webview) requires a real user gesture in the call
@@ -34,6 +46,6 @@ export function unlockAudio(): void {
     audio
       .play()
       .then(() => audio.pause())
-      .catch(() => {});
+      .catch((e) => console.error(`[sound] unlock of "${event}" (${SOUND_PATHS[event]}) failed:`, e));
   }
 }

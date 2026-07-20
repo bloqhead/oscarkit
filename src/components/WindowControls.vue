@@ -21,15 +21,11 @@ function close(): void {
 
 <style scoped>
 .window-controls {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
   height: 26px;
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  z-index: 200;
   user-select: none;
 }
 

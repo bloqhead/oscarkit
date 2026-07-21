@@ -1,28 +1,8 @@
 # oscarkit
 
-A cross-platform OSCAR protocol client for a self-hosted [Open OSCAR
-Server](https://github.com/mk6i/open-oscar-server) — retro AIM functionality,
-modern desktop app.
-
-## Pivot notice
-
-This repo originally started as a native SwiftUI/iOS client. That direction
-is on hold (no working Mac to build for), and the project has moved to
-**Tauri**: a Rust backend + Vue 3/TypeScript frontend, targeting Linux,
-Windows, and macOS as a single lightweight desktop app rather than bundling
-a full Chromium runtime the way Electron does. The Swift work isn't lost
-knowledge — the protocol design (SNAC families, TLV structure, login state
-machine) carries over directly, just re-implemented in Rust.
-
-## Why Rust for the backend, specifically
-
-Tauri's webview (the part that runs Vue) can't open raw TCP sockets — that's
-a fundamental browser sandboxing restriction, not a Tauri limitation. So the
-entire OSCAR protocol implementation lives in the Rust backend process, with
-the Vue frontend talking to it only through Tauri's IPC layer: `invoke()`
-calls for outbound actions (login, send message, set away status), and
-emitted events for things the server pushes at us (incoming messages,
-presence changes, buddy list updates).
+A cross-platform OSCAR protocol client (Tauri + Rust + Vue) for a
+self-hosted [Open OSCAR Server](https://github.com/mk6i/open-oscar-server)
+— retro AIM functionality, modern desktop app.
 
 ## What's here
 

@@ -3,7 +3,15 @@
 // request bug on Linux). The full sound pack still lives in public/sounds/
 // for reference; these three are duplicated into src/assets/ specifically
 // because they need to be import-embedded, not just copied as static files.
-import { buddyinData, buddyoutData, imrcvData, ringData, imsendData } from '../assets/soundData';
+import {
+  buddyinData,
+  buddyoutData,
+  imrcvData,
+  ringData,
+  imsendData,
+  welcomeData,
+  goodbyeData,
+} from '../assets/soundData';
 
 const SOUND_PATHS = {
   arrive: buddyinData,
@@ -14,6 +22,11 @@ const SOUND_PATHS = {
   // phone ringing for a fresh call vs. a text notification.
   newchat: ringData,
   sent: imsendData,
+  // Not authentic AIM (these are the classic AOL desktop client's own
+  // sounds), used anyway for the nostalgia value — deliberate choice, see
+  // public/sounds/README.md.
+  signOn: welcomeData,
+  signOff: goodbyeData,
 } as const;
 
 export type SoundEvent = keyof typeof SOUND_PATHS;

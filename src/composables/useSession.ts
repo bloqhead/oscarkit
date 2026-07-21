@@ -25,6 +25,8 @@ const soundPrefs = reactive({
   imReceived: true,
   imSent: true,
   idleReminder: true,
+  welcome: true,
+  goodbye: true,
 });
 
 let toastSeq = 0;
@@ -189,6 +191,7 @@ async function login(server: string, screenName: string, password: string): Prom
     const result = await invoke<SessionSnapshot>('login', { server, screenName, password });
     snapshot.value = result;
     currentScreen.value = 'buddylist';
+    if (soundPrefs.welcome) playSound('signOn');
   } catch (e) {
     errorMessage.value = String(e);
     throw e;
@@ -197,6 +200,7 @@ async function login(server: string, screenName: string, password: string): Prom
 
 async function logout(): Promise<void> {
   await invoke('logout');
+  if (soundPrefs.goodbye) playSound('signOff');
   resetSessionState();
 }
 

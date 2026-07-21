@@ -21,6 +21,14 @@ const { snapshot, goToBuddyList, soundPrefs, toggleBlock } = useSession();
       <section>
         <h2>Sounds</h2>
         <label class="toggle-row">
+          <span>Welcome sound</span>
+          <input v-model="soundPrefs.welcome" type="checkbox" />
+        </label>
+        <label class="toggle-row">
+          <span>Goodbye sound</span>
+          <input v-model="soundPrefs.goodbye" type="checkbox" />
+        </label>
+        <label class="toggle-row">
           <span>Buddy sign-on</span>
           <input v-model="soundPrefs.buddySignOn" type="checkbox" />
         </label>

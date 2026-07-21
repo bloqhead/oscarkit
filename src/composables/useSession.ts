@@ -23,6 +23,7 @@ const soundPrefs = reactive({
   buddySignOn: true,
   buddySignOff: true,
   imReceived: true,
+  imSent: true,
   idleReminder: true,
 });
 
@@ -68,6 +69,7 @@ watch(snapshot, (newSnap, oldSnap) => {
     const arrivals = newSnap.incoming_messages.slice(prevCount);
     for (const im of arrivals) {
       const key = normalizeScreenName(im.from);
+      const isNewThread = !messageThreads[key];
       const thread = messageThreads[key] ?? (messageThreads[key] = []);
       thread.push({ from: im.from, text: im.text, timestamp: Date.now(), direction: 'in' });
 
@@ -82,7 +84,9 @@ watch(snapshot, (newSnap, oldSnap) => {
       if (oldSnap && !isViewingThisThread) {
         unreadCounts[key] = (unreadCounts[key] ?? 0) + 1;
         pushToast('message', `New IM from ${im.from}`);
-        if (soundPrefs.imReceived) playSound('message');
+        // A brand-new conversation rings distinctly from a message arriving
+        // in one you've already got open elsewhere.
+        if (soundPrefs.imReceived) playSound(isNewThread ? 'newchat' : 'message');
       }
     }
   }
@@ -203,6 +207,7 @@ async function sendIm(recipient: string, text: string): Promise<void> {
   const key = normalizeScreenName(recipient);
   const thread = messageThreads[key] ?? (messageThreads[key] = []);
   thread.push({ from: snapshot.value!.screen_name, text, timestamp: Date.now(), direction: 'out' });
+  if (soundPrefs.imSent) playSound('sent');
 }
 
 async function addBuddy(screenName: string, groupName: string): Promise<void> {

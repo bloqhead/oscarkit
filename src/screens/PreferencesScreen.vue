@@ -33,6 +33,10 @@ const { snapshot, goToBuddyList, soundPrefs, toggleBlock } = useSession();
           <input v-model="soundPrefs.imReceived" type="checkbox" />
         </label>
         <label class="toggle-row">
+          <span>IM sent</span>
+          <input v-model="soundPrefs.imSent" type="checkbox" />
+        </label>
+        <label class="toggle-row">
           <span>Idle reminder</span>
           <input v-model="soundPrefs.idleReminder" type="checkbox" />
         </label>

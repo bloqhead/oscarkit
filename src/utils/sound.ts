@@ -1,10 +1,19 @@
-// Files live in public/sounds/ (see the README there) and are served as
-// static assets by Vite's public/ convention — no import needed, just a
-// stable /sounds/<name> path.
+// Embedded as base64 data URIs rather than referenced by /sounds/<name> URL
+// — see src/assets/soundData.ts for why (WebKitGTK's custom-protocol Range
+// request bug on Linux). The full sound pack still lives in public/sounds/
+// for reference; these three are duplicated into src/assets/ specifically
+// because they need to be import-embedded, not just copied as static files.
+import { buddyinData, buddyoutData, imrcvData, ringData, imsendData } from '../assets/soundData';
+
 const SOUND_PATHS = {
-  arrive: '/sounds/buddyin.mp3',
-  depart: '/sounds/buddyout.mp3',
-  message: '/sounds/imrcv.mp3',
+  arrive: buddyinData,
+  depart: buddyoutData,
+  message: imrcvData,
+  // A message from a buddy with no existing open thread — announced with a
+  // distinct "ring" rather than the softer message ping, same idea as a
+  // phone ringing for a fresh call vs. a text notification.
+  newchat: ringData,
+  sent: imsendData,
 } as const;
 
 export type SoundEvent = keyof typeof SOUND_PATHS;
@@ -17,7 +26,7 @@ function getAudio(event: SoundEvent): HTMLAudioElement {
   // Decode/network failures surface here (the media element's own error
   // event), separately from — and often instead of — a play() rejection.
   audio.addEventListener('error', () => {
-    console.error(`[sound] "${event}" (${SOUND_PATHS[event]}) failed to load:`, audio.error);
+    console.error(`[sound] "${event}" failed to load:`, audio.error);
   });
   audioCache[event] = audio;
   return audio;
@@ -31,7 +40,7 @@ export function playSound(event: SoundEvent): void {
   // messages to stderr when the app is run from a terminal, which is the
   // only way to see *why* playback failed (autoplay policy vs. missing
   // codec vs. a bad asset path all fail silently otherwise).
-  audio.play().catch((e) => console.error(`[sound] "${event}" (${SOUND_PATHS[event]}) failed to play:`, e));
+  audio.play().catch((e) => console.error(`[sound] "${event}" failed to play:`, e));
 }
 
 // WebKitGTK (the Linux webview) requires a real user gesture in the call
@@ -46,6 +55,6 @@ export function unlockAudio(): void {
     audio
       .play()
       .then(() => audio.pause())
-      .catch((e) => console.error(`[sound] unlock of "${event}" (${SOUND_PATHS[event]}) failed:`, e));
+      .catch((e) => console.error(`[sound] unlock of "${event}" failed:`, e));
   }
 }

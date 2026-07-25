@@ -4,6 +4,9 @@ import { listen } from '@tauri-apps/api/event';
 import type { Buddy, GroupedBuddies, Message, Screen, SessionSnapshot, Toast } from '../types';
 import { normalizeScreenName } from '../utils/screenName';
 import { playSound } from '../utils/sound';
+import { useNotifications } from './useNotifications';
+
+const { notify } = useNotifications();
 
 // Module-scope singleton state — every useSession() call shares the same
 // instance. No Pinia needed at this app's size.
@@ -59,6 +62,10 @@ watch(snapshot, (newSnap, oldSnap) => {
         const kind = buddy.is_online ? 'arrive' : 'depart';
         pushToast(kind, buddy.screen_name);
         if (buddy.is_online ? soundPrefs.buddySignOn : soundPrefs.buddySignOff) playSound(kind);
+        // Native notifications are for when you're not looking at the app
+        // at all (notify() itself checks window focus) — not gated by the
+        // sound toggles, which are a separate concern.
+        notify(buddy.screen_name, buddy.is_online ? 'Signed on' : 'Signed off');
       }
     }
   }
@@ -89,6 +96,7 @@ watch(snapshot, (newSnap, oldSnap) => {
         // A brand-new conversation rings distinctly from a message arriving
         // in one you've already got open elsewhere.
         if (soundPrefs.imReceived) playSound(isNewThread ? 'newchat' : 'message');
+        notify(im.from, im.text);
       }
     }
   }

@@ -1,6 +1,10 @@
 <script setup lang="ts">
+import { onMounted } from 'vue';
 import { useSession } from './composables/useSession';
+import { useUpdater } from './composables/useUpdater';
+import { useNotifications } from './composables/useNotifications';
 import WindowControls from './components/WindowControls.vue';
+import UpdateBanner from './components/UpdateBanner.vue';
 import SignOnScreen from './screens/SignOnScreen.vue';
 import BuddyListScreen from './screens/BuddyListScreen.vue';
 import ImScreen from './screens/ImScreen.vue';
@@ -9,6 +13,15 @@ import AwayMessageScreen from './screens/AwayMessageScreen.vue';
 import PreferencesScreen from './screens/PreferencesScreen.vue';
 
 const { currentScreen } = useSession();
+const { checkForUpdate } = useUpdater();
+const { ensurePermission } = useNotifications();
+
+// Both checked once at startup, independent of sign-on — these are about
+// the app itself, not the OSCAR session.
+onMounted(() => {
+  checkForUpdate();
+  ensurePermission();
+});
 </script>
 
 <template>
@@ -16,12 +29,15 @@ const { currentScreen } = useSession();
     <WindowControls />
     <div class="frame-wrap">
       <div class="phone-frame">
-        <SignOnScreen v-if="currentScreen === 'signon'" />
-        <BuddyListScreen v-else-if="currentScreen === 'buddylist'" />
-        <ImScreen v-else-if="currentScreen === 'im'" />
-        <BuddyInfoScreen v-else-if="currentScreen === 'info'" />
-        <AwayMessageScreen v-else-if="currentScreen === 'away'" />
-        <PreferencesScreen v-else-if="currentScreen === 'preferences'" />
+        <UpdateBanner />
+        <div class="screen-wrap">
+          <SignOnScreen v-if="currentScreen === 'signon'" />
+          <BuddyListScreen v-else-if="currentScreen === 'buddylist'" />
+          <ImScreen v-else-if="currentScreen === 'im'" />
+          <BuddyInfoScreen v-else-if="currentScreen === 'info'" />
+          <AwayMessageScreen v-else-if="currentScreen === 'away'" />
+          <PreferencesScreen v-else-if="currentScreen === 'preferences'" />
+        </div>
       </div>
     </div>
   </div>
@@ -52,5 +68,14 @@ const { currentScreen } = useSession();
   overflow: hidden;
   position: relative;
   border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+}
+
+.screen-wrap {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 </style>

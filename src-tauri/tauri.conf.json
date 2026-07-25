@@ -22,12 +22,20 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": {
+        "default-src": "'self'",
+        "connect-src": "ipc: http://ipc.localhost",
+        "script-src": "'self'",
+        "style-src": "'self' 'unsafe-inline'",
+        "media-src": "'self' data:",
+        "img-src": "'self' data:"
+      }
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -35,5 +43,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEM0NDY5RTY0NkVGQkRCRTAKUldUZzIvdHVaSjVHeElKeG1zemNUQld2eCtNSzJDZlZrK3ZWNHhKOW5MQ3ViUHVmczJFMFlIWUsK",
+      "endpoints": [
+        "https://github.com/bloqhead/oscarkit/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

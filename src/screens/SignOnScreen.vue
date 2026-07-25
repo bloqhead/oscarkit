@@ -1,15 +1,39 @@
 <script setup lang="ts">
-import { ref } from 'vue';
+import { onMounted, ref } from 'vue';
 import { useSession } from '../composables/useSession';
+import { useCredentials } from '../composables/useCredentials';
 import { unlockAudio } from '../utils/sound';
 
 const { login, errorMessage } = useSession();
+const {
+  savedServer,
+  savedScreenName,
+  loadSavedCredentials,
+  saveCredentials,
+  getSavedPassword,
+  savePassword,
+  deleteSavedPassword,
+} = useCredentials();
 
 const server = ref('');
 const screenName = ref('');
 const password = ref('');
-const savePassword = ref(false);
+const rememberPassword = ref(false);
 const isSubmitting = ref(false);
+
+onMounted(async () => {
+  await loadSavedCredentials();
+  server.value = savedServer.value;
+  screenName.value = savedScreenName.value;
+
+  if (screenName.value) {
+    const saved = await getSavedPassword(screenName.value);
+    if (saved !== null) {
+      password.value = saved;
+      rememberPassword.value = true;
+    }
+  }
+});
 
 async function handleSubmit(): Promise<void> {
   // Must happen synchronously, inside this real user-gesture call stack —
@@ -18,6 +42,12 @@ async function handleSubmit(): Promise<void> {
   isSubmitting.value = true;
   try {
     await login(server.value, screenName.value, password.value);
+    await saveCredentials(server.value, screenName.value);
+    if (rememberPassword.value) {
+      await savePassword(screenName.value, password.value);
+    } else {
+      await deleteSavedPassword(screenName.value);
+    }
   } catch {
     // errorMessage is already set by the composable — nothing else to do.
   } finally {
@@ -49,7 +79,7 @@ async function handleSubmit(): Promise<void> {
       <input v-model="screenName" class="text-input" type="text" placeholder="Screen name" autocomplete="username" />
       <input v-model="password" class="text-input" type="password" placeholder="Password" autocomplete="current-password" />
       <label class="save-password">
-        <input v-model="savePassword" type="checkbox" />
+        <input v-model="rememberPassword" type="checkbox" />
         Save password
       </label>
       <p v-if="errorMessage" class="error">{{ errorMessage }}</p>

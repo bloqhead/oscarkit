@@ -1,4 +1,5 @@
 mod commands;
+mod credentials;
 mod session_actor;
 
 use std::sync::Mutex;
@@ -20,6 +21,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_store::Builder::new().build())
         .manage(SessionState(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
             commands::login,
@@ -32,6 +34,9 @@ pub fn run() {
             commands::add_to_block_list,
             commands::remove_from_block_list,
             commands::logout,
+            credentials::save_password,
+            credentials::get_saved_password,
+            credentials::delete_saved_password,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

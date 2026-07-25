@@ -10,7 +10,7 @@ import BlockedBadge from '../components/BlockedBadge.vue';
 import UnreadBadge from '../components/UnreadBadge.vue';
 import ToastContainer from '../components/ToastContainer.vue';
 
-const { snapshot, groupedBuddies, unreadFor, goToIm, goToAway, goToPreferences, clearAway, logout, addBuddy } =
+const { snapshot, groupedBuddies, unreadFor, goToIm, goToInfo, goToAway, goToPreferences, clearAway, logout, addBuddy } =
   useSession();
 
 async function handleImBack(): Promise<void> {
@@ -89,6 +89,14 @@ async function handleAddBuddy(): Promise<void> {
           <WarningBadge :level="buddy.warning_level" />
           <BlockedBadge v-if="buddy.is_blocked" />
           <UnreadBadge :count="unreadFor(buddy.screen_name)" />
+          <button
+            class="info-btn"
+            type="button"
+            aria-label="Buddy Info"
+            @click.stop="goToInfo(buddy.screen_name)"
+          >
+            i
+          </button>
           <StatusDot :status="buddyStatus(buddy)" />
         </div>
       </div>
@@ -160,6 +168,23 @@ async function handleAddBuddy(): Promise<void> {
   padding: 6px 12px;
   cursor: pointer;
   border-bottom: 1px solid #f0f0f0;
+}
+
+.info-btn {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 1px solid #ccc;
+  background: #f7f7f7;
+  color: #666;
+  font-family: var(--font-aim);
+  font-style: italic;
+  font-weight: 700;
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
 }
 
 .buddy-row:hover {

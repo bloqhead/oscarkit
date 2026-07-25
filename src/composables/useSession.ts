@@ -1,7 +1,8 @@
 import { computed, reactive, ref, watch } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
-import type { Buddy, GroupedBuddies, Message, Screen, SessionSnapshot, Toast } from '../types';
+import { emitTo, listen } from '@tauri-apps/api/event';
+import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
+import type { Buddy, GroupedBuddies, ImSeedPayload, Message, Screen, SessionSnapshot, Toast } from '../types';
 import { normalizeScreenName } from '../utils/screenName';
 import { playSound } from '../utils/sound';
 import { useNotifications } from './useNotifications';
@@ -9,12 +10,13 @@ import { useNotifications } from './useNotifications';
 const { notify } = useNotifications();
 
 // Module-scope singleton state — every useSession() call shares the same
-// instance. No Pinia needed at this app's size.
+// instance. No Pinia needed at this app's size. This is the hub only —
+// each open conversation is a separate OS window/JS runtime with its own
+// thin useImWindow() state; see that file for why hub state can't just be
+// shared across windows.
 
 const currentScreen = ref<Screen>('signon');
-const activeBuddy = ref<string | null>(null);
 const infoBuddy = ref<string | null>(null);
-const infoReturnScreen = ref<'im' | 'buddylist'>('buddylist');
 
 const snapshot = ref<SessionSnapshot | null>(null);
 const errorMessage = ref<string | null>(null);
@@ -32,6 +34,11 @@ const soundPrefs = reactive({
   goodbye: true,
 });
 
+// Which conversations currently have an open OS window, keyed by the same
+// label the window was created with. Plain (not reactive) — only ever read/
+// written from functions below, nothing templated renders it directly.
+const openImWindows = new Set<string>();
+
 let toastSeq = 0;
 
 function pushToast(kind: Toast['kind'], text: string): void {
@@ -44,6 +51,64 @@ function dismissToast(id: number): void {
   const idx = toasts.findIndex((t) => t.id === id);
   if (idx !== -1) toasts.splice(idx, 1);
 }
+
+function labelFor(buddyName: string): string {
+  return `im-${normalizeScreenName(buddyName)}`;
+}
+
+// Opens a real OS window for this conversation (mirroring classic AIM: every
+// conversation is its own movable, independently-closable window), or
+// focuses the existing one if already open.
+async function openImWindow(buddyName: string): Promise<void> {
+  const label = labelFor(buddyName);
+  unreadCounts[normalizeScreenName(buddyName)] = 0;
+
+  const existing = await WebviewWindow.getByLabel(label);
+  if (existing) {
+    await existing.setFocus();
+    return;
+  }
+
+  const win = new WebviewWindow(label, {
+    url: `/#/im/${encodeURIComponent(buddyName)}`,
+    title: buddyName,
+    width: 340,
+    height: 480,
+    decorations: false,
+    resizable: true,
+  });
+  openImWindows.add(label);
+  win.once('tauri://destroyed', () => {
+    openImWindows.delete(label);
+  });
+}
+
+// Answers a freshly-opened IM window's im-window-ready announcement with a
+// one-time snapshot of what it needs to boot. Necessary because emit/listen
+// is live pub-sub, not a durable queue — the window's own listen() only
+// sees events fired after it registers, and there's no snapshot-on-demand
+// command, so without this a new window would open blank until some
+// unrelated future event happened to arrive. See useImWindow.ts.
+listen<{ label: string }>('im-window-ready', (event) => {
+  const label = event.payload.label;
+  const slug = label.startsWith('im-') ? label.slice(3) : label;
+  const buddy = getBuddy(slug);
+  if (!buddy || !snapshot.value) return;
+  const seed: ImSeedPayload = { buddy, thread: getThread(slug), myScreenName: snapshot.value.screen_name };
+  emitTo(label, 'im-seed', seed);
+});
+
+// An IM window's own thread dies when that window closes, so it reports
+// what it sent back here for durable storage — otherwise reopening a
+// closed conversation would show what the other person said but not your
+// own side of it. Also where the "sent" sound stays, same as every other
+// sound decision — centralized in the hub, never duplicated per-window.
+listen<{ buddyName: string; message: Message }>('im-sent', (event) => {
+  const key = normalizeScreenName(event.payload.buddyName);
+  const thread = messageThreads[key] ?? (messageThreads[key] = []);
+  thread.push(event.payload.message);
+  if (soundPrefs.imSent) playSound('sent');
+});
 
 // `snapshot.value` is reassigned wholesale on every session-update event
 // (never mutated in place), so Vue's watch callback receives the true
@@ -82,21 +147,27 @@ watch(snapshot, (newSnap, oldSnap) => {
       const thread = messageThreads[key] ?? (messageThreads[key] = []);
       thread.push({ from: im.from, text: im.text, timestamp: Date.now(), direction: 'in' });
 
-      const isViewingThisThread =
-        currentScreen.value === 'im' &&
-        activeBuddy.value !== null &&
-        normalizeScreenName(activeBuddy.value) === key;
+      // A window already open for this buddy is treated as "you're seeing
+      // this conversation live" — a coarser proxy than true per-window
+      // focus tracking (which would need each IM window to report its own
+      // focus state back here), but a reasonable one: once you've opened a
+      // conversation, toast/sound/notification spam for it stops until you
+      // close the window again.
+      const hasOpenWindow = openImWindows.has(labelFor(im.from));
 
       // On the very first snapshot after login (oldSnap undefined), threads
-      // are seeded but nothing is toasted/counted — those messages predate
-      // the UI watching for them.
-      if (oldSnap && !isViewingThisThread) {
+      // are seeded but nothing is toasted/counted/opened — those messages
+      // predate the UI watching for them.
+      if (oldSnap && !hasOpenWindow) {
         unreadCounts[key] = (unreadCounts[key] ?? 0) + 1;
         pushToast('message', `New IM from ${im.from}`);
         // A brand-new conversation rings distinctly from a message arriving
         // in one you've already got open elsewhere.
         if (soundPrefs.imReceived) playSound(isNewThread ? 'newchat' : 'message');
         notify(im.from, im.text);
+        // Classic AIM opens a window the moment a conversation starts, not
+        // just when you click something — mirror that here.
+        openImWindow(im.from);
       }
     }
   }
@@ -117,7 +188,6 @@ listen<string>('session-error', (event) => {
 function resetSessionState(): void {
   snapshot.value = null;
   currentScreen.value = 'signon';
-  activeBuddy.value = null;
   infoBuddy.value = null;
   for (const key of Object.keys(messageThreads)) delete messageThreads[key];
   for (const key of Object.keys(unreadCounts)) delete unreadCounts[key];
@@ -170,19 +240,16 @@ function goToBuddyList(): void {
 }
 
 function goToIm(screenName: string): void {
-  activeBuddy.value = screenName;
-  unreadCounts[normalizeScreenName(screenName)] = 0;
-  currentScreen.value = 'im';
+  openImWindow(screenName);
 }
 
-function goToInfo(screenName: string, from: 'im' | 'buddylist'): void {
+function goToInfo(screenName: string): void {
   infoBuddy.value = screenName;
-  infoReturnScreen.value = from;
   currentScreen.value = 'info';
 }
 
 function backFromInfo(): void {
-  currentScreen.value = infoReturnScreen.value;
+  currentScreen.value = 'buddylist';
 }
 
 function goToAway(): void {
@@ -210,16 +277,6 @@ async function logout(): Promise<void> {
   await invoke('logout');
   if (soundPrefs.goodbye) playSound('signOff');
   resetSessionState();
-}
-
-async function sendIm(recipient: string, text: string): Promise<void> {
-  await guarded(() => invoke('send_message', { recipient, text }), "Couldn't send message");
-  // The backend never echoes what we sent, so this is the only way sent
-  // messages end up in a thread. Only reached if the send above succeeded.
-  const key = normalizeScreenName(recipient);
-  const thread = messageThreads[key] ?? (messageThreads[key] = []);
-  thread.push({ from: snapshot.value!.screen_name, text, timestamp: Date.now(), direction: 'out' });
-  if (soundPrefs.imSent) playSound('sent');
 }
 
 async function addBuddy(screenName: string, groupName: string): Promise<void> {
@@ -259,7 +316,6 @@ async function toggleBlock(buddy: Buddy): Promise<void> {
 export function useSession() {
   return {
     currentScreen,
-    activeBuddy,
     infoBuddy,
     snapshot,
     errorMessage,
@@ -280,7 +336,6 @@ export function useSession() {
 
     login,
     logout,
-    sendIm,
     addBuddy,
     removeBuddy,
     setAway,

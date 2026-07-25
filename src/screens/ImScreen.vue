@@ -1,17 +1,20 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue';
-import { useSession } from '../composables/useSession';
+import { nextTick, ref, watch } from 'vue';
+import { getCurrentWindow } from '@tauri-apps/api/window';
+import { useImWindow } from '../composables/useImWindow';
 import { buddyStatus, formatTimestamp, statusLabel } from '../utils/format';
 import { escapeMessageText, sanitizeFormattedMessage } from '../utils/sanitizeFormattedMessage';
 import TitleBar from '../components/TitleBar.vue';
 import StatusDot from '../components/StatusDot.vue';
 
-const { snapshot, activeBuddy, getBuddy, getThread, goToBuddyList, goToInfo, sendIm } = useSession();
+const { buddy, thread, sendIm } = useImWindow();
 
-const buddy = computed(() => (activeBuddy.value ? getBuddy(activeBuddy.value) : undefined));
-const thread = computed(() => (activeBuddy.value ? getThread(activeBuddy.value) : []));
 const messageText = ref('');
 const messageListEl = ref<HTMLDivElement | null>(null);
+
+function closeWindow(): void {
+  getCurrentWindow().close();
+}
 
 const boldActive = ref(false);
 const italicActive = ref(false);
@@ -42,35 +45,24 @@ function applyFormatting(text: string): string {
 
 async function handleSend(): Promise<void> {
   const raw = messageText.value.trim();
-  if (!raw || !activeBuddy.value) return;
+  if (!raw) return;
   messageText.value = '';
-  await sendIm(activeBuddy.value, applyFormatting(raw));
+  await sendIm(applyFormatting(raw));
 }
 </script>
 
 <template>
   <div class="im-screen">
-    <TitleBar :title="activeBuddy ?? ''" :show-back="true" @back="goToBuddyList">
+    <TitleBar :title="buddy?.screen_name ?? ''" :show-back="true" @back="closeWindow">
       <template #leading>
         <StatusDot v-if="buddy" :status="buddyStatus(buddy)" />
-      </template>
-      <template #trailing>
-        <button
-          class="info-btn"
-          aria-label="Buddy Info"
-          @click="activeBuddy && goToInfo(activeBuddy, 'im')"
-        >
-          i
-        </button>
       </template>
     </TitleBar>
     <div v-if="buddy" class="status-line">{{ statusLabel(buddy) }}</div>
 
     <div ref="messageListEl" class="message-list">
       <div v-for="(msg, idx) in thread" :key="idx" class="message-line">
-        <span class="from" :class="msg.direction === 'out' ? 'me' : 'them'">
-          {{ msg.direction === 'out' ? snapshot?.screen_name : msg.from }}:
-        </span>
+        <span class="from" :class="msg.direction === 'out' ? 'me' : 'them'">{{ msg.from }}:</span>
         <span class="text" v-html="sanitizeFormattedMessage(msg.text)"></span>
         <span class="time">{{ formatTimestamp(msg.timestamp) }}</span>
       </div>
@@ -134,22 +126,6 @@ async function handleSend(): Promise<void> {
   display: flex;
   flex-direction: column;
   background: #fff;
-}
-
-.info-btn {
-  width: 22px;
-  height: 22px;
-  border-radius: 50%;
-  border: 1px solid #fff;
-  background: transparent;
-  color: #fff;
-  font-family: var(--font-aim);
-  font-style: italic;
-  font-weight: 700;
-  font-size: 12px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
 }
 
 .status-line {

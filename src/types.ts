@@ -26,7 +26,9 @@ export interface SessionSnapshot {
 
 // Frontend-only types below — no backend equivalent.
 
-export type Screen = 'signon' | 'buddylist' | 'im' | 'info' | 'away' | 'preferences';
+// 'im' isn't a hub screen — each conversation is its own OS window
+// (src/screens/ImWindow.vue), not a state inside this switch.
+export type Screen = 'signon' | 'buddylist' | 'info' | 'away' | 'preferences';
 
 export interface Message {
   from: string;
@@ -46,4 +48,14 @@ export interface GroupedBuddies {
   online: number;
   total: number;
   buddies: Buddy[];
+}
+
+// Cross-window seed handshake (see useSession.ts / useImWindow.ts): a
+// freshly-opened IM window's listen('session-update', ...) only sees events
+// fired after it registers, so the hub replies with a one-time snapshot of
+// what that window needs on boot via emitTo(label, 'im-seed', ...).
+export interface ImSeedPayload {
+  buddy: Buddy;
+  thread: Message[];
+  myScreenName: string;
 }

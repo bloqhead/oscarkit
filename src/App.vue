@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { onMounted } from 'vue';
+import { getCurrentWindow } from '@tauri-apps/api/window';
+import { exit } from '@tauri-apps/plugin-process';
 import { useSession } from './composables/useSession';
 import { useUpdater } from './composables/useUpdater';
 import { useNotifications } from './composables/useNotifications';
@@ -7,7 +9,6 @@ import WindowControls from './components/WindowControls.vue';
 import UpdateBanner from './components/UpdateBanner.vue';
 import SignOnScreen from './screens/SignOnScreen.vue';
 import BuddyListScreen from './screens/BuddyListScreen.vue';
-import ImScreen from './screens/ImScreen.vue';
 import BuddyInfoScreen from './screens/BuddyInfoScreen.vue';
 import AwayMessageScreen from './screens/AwayMessageScreen.vue';
 import PreferencesScreen from './screens/PreferencesScreen.vue';
@@ -21,6 +22,18 @@ const { ensurePermission } = useNotifications();
 onMounted(() => {
   checkForUpdate();
   ensurePermission();
+
+  // Tauri's default is "quit once every window is closed" — now that IM
+  // conversations open as their own windows, closing just the hub would
+  // otherwise leave them orphaned with no way back to Buddy List (no tray
+  // icon to reopen it from). Closing the hub means quitting entirely,
+  // taking any open IM windows with it — this intercepts both the custom
+  // WindowControls close button and WM-level close (Alt+F4/taskbar), since
+  // decorations being off only affects drawn chrome, not the close protocol.
+  getCurrentWindow().onCloseRequested(async (event) => {
+    event.preventDefault();
+    await exit(0);
+  });
 });
 </script>
 
@@ -33,7 +46,6 @@ onMounted(() => {
         <div class="screen-wrap">
           <SignOnScreen v-if="currentScreen === 'signon'" />
           <BuddyListScreen v-else-if="currentScreen === 'buddylist'" />
-          <ImScreen v-else-if="currentScreen === 'im'" />
           <BuddyInfoScreen v-else-if="currentScreen === 'info'" />
           <AwayMessageScreen v-else-if="currentScreen === 'away'" />
           <PreferencesScreen v-else-if="currentScreen === 'preferences'" />

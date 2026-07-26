@@ -9,10 +9,12 @@
 
 use std::collections::HashMap;
 
+use crate::chat::ChatRoomSession;
+use crate::chat_nav::{ChatNavSession, ChatRoomHandle};
 use crate::connection::{FlapConnection, FlapReader, FlapWriter};
 use crate::feedbag::{Buddy, FeedbagItem};
 use crate::flap::{FlapChannel, FlapFrame};
-use crate::messaging::IncomingIm;
+use crate::messaging::{ChatInvite, IncomingIm};
 use crate::server_address::ServerAddress;
 use crate::snac::{hex_dump, Snac, SnacFamily, SnacHeader, Tlv};
 
@@ -57,6 +59,11 @@ pub struct OscarSession {
     pub away_message: Option<String>,
     /// Instant messages received so far, in arrival order.
     pub incoming_messages: Vec<IncomingIm>,
+    /// Chat-room invite proposals received so far (ICBM channel 2), in
+    /// arrival order. See `messaging.rs` for why these arrive via the same
+    /// ICBM incoming-message SNAC as regular IMs, distinguished only by a
+    /// body-level channel field.
+    pub incoming_chat_invites: Vec<ChatInvite>,
 
     ids: RequestIdCounter,
     feedbag_item_id_counter: u16,
@@ -64,6 +71,38 @@ pub struct OscarSession {
     /// request_id of that warning SNAC, so the (screen-name-less) reply can
     /// be attributed back to the right buddy. See `messaging.rs::send_warning`.
     pub(crate) pending_warnings: HashMap<u32, String>,
+    /// Results of `OServiceServiceRequest`s (redirect to ChatNav or a
+    /// specific Chat room) whose `OServiceServiceResponse` has already been
+    /// seen by `dispatch_frame`, keyed by request_id, waiting to be claimed
+    /// by whoever sent the request. See `request_service_redirect`'s doc
+    /// comment for why this is a poll-able cache rather than a oneshot: in
+    /// real (Tauri actor) usage, nothing else can concurrently call
+    /// `dispatch_frame` while a caller is `.await`ing inside
+    /// `request_service_redirect` — the actor's own frame-processing loop
+    /// *is* what's suspended by that call. `request_service_redirect` has
+    /// to pull and dispatch further frames itself (via the `FrameSource` it
+    /// takes as a parameter) rather than relying on a concurrent waker.
+    pending_service_redirect_replies: HashMap<u32, (ServerAddress, Vec<u8>)>,
+}
+
+/// Where `request_service_redirect` (and the room-create/join flow built on
+/// it) gets its next frame from, while a reply to a request it sent is still
+/// outstanding. Generic rather than a concrete type because the answer is
+/// different depending on whether `OscarSession::split_reader()` has been
+/// called yet: before that, a `FlapReader` itself works directly (tests, or
+/// any non-actor usage — reads straight off the socket). After that (real
+/// Tauri actor usage), the actual `FlapReader` is owned by a dedicated
+/// reader task forwarding frames over a channel, so the Tauri layer
+/// implements this trait over that channel's receiver instead — see
+/// `src-tauri/src/chat_actor.rs`.
+pub trait FrameSource {
+    async fn next_frame(&mut self) -> Result<FlapFrame, OscarError>;
+}
+
+impl FrameSource for FlapReader {
+    async fn next_frame(&mut self) -> Result<FlapFrame, OscarError> {
+        self.read_frame().await?.ok_or(OscarError::ConnectionClosed("bos session"))
+    }
 }
 
 /// The *only* password hashing OSCAR uses: a chained MD5 combining the
@@ -86,6 +125,10 @@ fn roast_password(auth_key: &[u8], password: &str) -> [u8; 16] {
 /// feedbag/locate/messaging methods on `OscarSession`.
 pub(crate) struct RequestIdCounter(u32);
 impl RequestIdCounter {
+    pub(crate) fn new() -> Self {
+        RequestIdCounter(0)
+    }
+
     pub(crate) fn next(&mut self) -> u32 {
         self.0 = self.0.wrapping_add(1);
         self.0
@@ -175,12 +218,31 @@ impl OscarSession {
         }
 
         match SnacFamily::from_u16(snac.header.family) {
-            Some(SnacFamily::Messaging) => match snac.header.subtype {
-                crate::messaging::INCOMING_IM => {
-                    if let Some(im) = crate::messaging::parse_incoming_im(&snac.body) {
-                        self.incoming_messages.push(im);
-                    }
+            // OServiceServiceResponse — the reply to a mid-session redirect
+            // request (ChatNav or a specific Chat room). Chat/ChatNav frames
+            // themselves never arrive on BOS (they arrive on their own
+            // dedicated connections once redirected), so this is the only
+            // Generic-family subtype this dispatch needs to special-case
+            // beyond the error-SNAC logging above.
+            Some(SnacFamily::Generic) if snac.header.subtype == 0x05 => {
+                let tlvs = Tlv::parse_all(&snac.body);
+                if let Ok(result) = parse_redirect_address_and_cookie(&tlvs) {
+                    self.pending_service_redirect_replies.insert(snac.header.request_id, result);
                 }
+            }
+            Some(SnacFamily::Messaging) => match snac.header.subtype {
+                crate::messaging::INCOMING_IM => match crate::messaging::icbm_channel(&snac.body) {
+                    Some(2) => {
+                        if let Some(invite) = crate::messaging::parse_chat_invite(&snac.body) {
+                            self.incoming_chat_invites.push(invite);
+                        }
+                    }
+                    _ => {
+                        if let Some(im) = crate::messaging::parse_incoming_im(&snac.body) {
+                            self.incoming_messages.push(im);
+                        }
+                    }
+                },
                 crate::messaging::WARNING_REPLY => self.handle_warning_reply(&snac),
                 _ => {}
             },
@@ -191,10 +253,177 @@ impl OscarSession {
         }
         Ok(())
     }
+
+    /// Sends SNAC(0x01,0x04) `OServiceServiceRequest` on the live BOS
+    /// connection requesting a redirect to `food_group` (ChatNav = 0x000D,
+    /// or a specific Chat room = 0x000E), with `extra_tlvs` carrying
+    /// whatever the target needs to identify the request (a Chat redirect
+    /// needs the room's exchange/cookie/instance as TLV 0x01, a
+    /// `SNAC_0x01_0x04_TLVRoomInfo`-shaped triple — see `chat_nav.rs`).
+    /// Awaits the matching `OServiceServiceResponse` by pulling further BOS
+    /// frames from `frames` and dispatching each through `self` (which
+    /// populates `pending_service_redirect_replies`) until the one for this
+    /// request shows up. `frames` is injected rather than read directly off
+    /// `self.bos_reader` because, inside the real Tauri actor, the reader is
+    /// already split out and owned by a separate task — this method has to
+    /// be able to pull frames from whatever the caller has on hand (a
+    /// `FlapReader` directly in tests, or a thin wrapper around the actor's
+    /// `mpsc::Receiver<FrameEvent>` in production) instead of assuming
+    /// exclusive ownership of a socket it doesn't have.
+    async fn request_service_redirect<S: FrameSource>(
+        &mut self,
+        food_group: u16,
+        extra_tlvs: Vec<Tlv>,
+        frames: &mut S,
+    ) -> Result<(ServerAddress, Vec<u8>), OscarError> {
+        let mut body = food_group.to_be_bytes().to_vec();
+        for tlv in extra_tlvs {
+            body.extend(tlv.encode());
+        }
+        let request_id = self.next_request_id();
+
+        let header = SnacHeader { family: SnacFamily::Generic.as_u16(), subtype: 0x04, flags: 0, request_id };
+        self.bos_connection.send_snac(&Snac { header, body }).await?;
+
+        loop {
+            if let Some(result) = self.pending_service_redirect_replies.remove(&request_id) {
+                return Ok(result);
+            }
+            let frame = frames.next_frame().await?;
+            self.dispatch_frame(frame).await?;
+        }
+    }
+
+    /// Full create flow: BOS -> ChatNav redirect, connect, create the room,
+    /// drop the ChatNav connection (it's ephemeral — nothing about a room
+    /// needs it again after creation), then join the newly created room
+    /// exactly like `join_room` would.
+    pub async fn create_and_join_room<S: FrameSource>(&mut self, room_name: &str, frames: &mut S) -> Result<ChatRoomSession, OscarError> {
+        let (address, cookie) = self.request_service_redirect(SnacFamily::ChatNav.as_u16(), Vec::new(), frames).await?;
+        let mut chat_nav = ChatNavSession::connect(&address, cookie).await?;
+        let handle = chat_nav.create_room(room_name).await?;
+        drop(chat_nav);
+        self.redirect_and_join(handle, frames).await
+    }
+
+    /// Joins a room identified by a handle obtained elsewhere — e.g. from an
+    /// accepted invite (`incoming_chat_invites`), which carries the
+    /// exchange/cookie/instance directly without ever needing to talk to
+    /// ChatNav at all.
+    pub async fn join_room<S: FrameSource>(&mut self, handle: &ChatRoomHandle, frames: &mut S) -> Result<ChatRoomSession, OscarError> {
+        self.redirect_and_join(handle.clone(), frames).await
+    }
+
+    async fn redirect_and_join<S: FrameSource>(&mut self, handle: ChatRoomHandle, frames: &mut S) -> Result<ChatRoomSession, OscarError> {
+        let mut room_selector = handle.exchange.to_be_bytes().to_vec();
+        let cookie_bytes = handle.room_cookie.as_bytes();
+        room_selector.push(cookie_bytes.len() as u8);
+        room_selector.extend_from_slice(cookie_bytes);
+        room_selector.extend_from_slice(&handle.instance.to_be_bytes());
+
+        let (address, cookie) = self
+            .request_service_redirect(SnacFamily::Chat.as_u16(), vec![Tlv::new(0x01, room_selector)], frames)
+            .await?;
+        let mut connection = connect_redirect(&address, cookie).await?;
+
+        // Announce only the Chat family here — unlike BOS's ClientOnline
+        // (which lists every family this client supports and is what makes
+        // the server consider sign-on "complete"), a chat room's bootstrap
+        // is different: the server proactively pushes the occupant list and
+        // room metadata once it sees us online, no broader announcement
+        // needed or expected.
+        let mut ids = RequestIdCounter::new();
+        let client_online_body = {
+            let mut body = SnacFamily::Chat.as_u16().to_be_bytes().to_vec();
+            body.extend_from_slice(&1u16.to_be_bytes()); // version
+            body.extend_from_slice(&0u16.to_be_bytes()); // tool ID
+            body.extend_from_slice(&0u16.to_be_bytes()); // tool version
+            body
+        };
+        let header = SnacHeader { family: SnacFamily::Generic.as_u16(), subtype: 0x02, flags: 0, request_id: ids.next() };
+        connection.send_snac(&Snac { header, body: client_online_body }).await?;
+
+        // Mandated join sequence (order matters — see chat.rs/research doc):
+        // full occupant list (joiner only), then room metadata (joiner
+        // only). The third message (self-only ChatUsersJoined broadcast to
+        // everyone *else*) isn't ours to wait for.
+        let mut occupants = Vec::new();
+        let mut room_handle = handle;
+        loop {
+            let frame = connection.read_frame().await?.ok_or(OscarError::ConnectionClosed("waiting for chat join sequence"))?;
+            if frame.channel != FlapChannel::Data {
+                continue;
+            }
+            let Some(snac) = Snac::parse(&frame.payload) else { continue };
+            if SnacFamily::from_u16(snac.header.family) != Some(SnacFamily::Chat) {
+                continue;
+            }
+            match snac.header.subtype {
+                0x03 => occupants = crate::chat::parse_user_info_list(&snac.body),
+                0x02 => {
+                    if let Some(updated) = crate::chat_nav::parse_chat_room_info_update(&snac.body) {
+                        room_handle = updated;
+                    }
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        let (reader, writer) = connection.into_split();
+        let mut session = ChatRoomSession::new(writer, reader, room_handle, self.screen_name.clone());
+        session.occupants = occupants;
+        Ok(session)
+    }
+}
+
+/// Connects to any OSCAR service-redirect target the same way — ChatNav, a
+/// specific joined Chat room, or BOS itself during login: a fresh FLAP
+/// connection, a channel-1 hello carrying the handoff cookie as TLV 0x06,
+/// then block until the server's "host online" signal (Generic family,
+/// subtype 0x03). Shared by `login()`'s BOS hop and
+/// `OscarSession::redirect_and_join`'s Chat hop (`chat_nav.rs`'s
+/// `ChatNavSession::connect` also uses this shape directly).
+pub(crate) async fn connect_redirect(address: &ServerAddress, cookie: Vec<u8>) -> Result<FlapConnection, OscarError> {
+    let mut connection = FlapConnection::connect(address).await?;
+
+    let mut hello_payload = 1u32.to_be_bytes().to_vec();
+    hello_payload.extend(Tlv::new(0x06, cookie).encode());
+    connection.send(FlapChannel::NewConnection, hello_payload).await?;
+
+    loop {
+        let frame = connection
+            .read_frame()
+            .await?
+            .ok_or(OscarError::ConnectionClosed("waiting for host online"))?;
+        if frame.channel != FlapChannel::Data {
+            continue;
+        }
+        let Some(snac) = Snac::parse(&frame.payload) else { continue };
+        if snac.header.family == SnacFamily::Generic.as_u16() && snac.header.subtype == 0x03 {
+            break;
+        }
+    }
+
+    Ok(connection)
+}
+
+/// TLV 0x05 (redirect target address string) + TLV 0x06 (opaque handoff
+/// cookie) — the pair every `OServiceServiceResponse` carries, including
+/// the BUCP login response itself (which is structurally the same redirect
+/// mechanism, just arriving over the auth-specific SNAC family rather than
+/// Generic).
+pub(crate) fn parse_redirect_address_and_cookie(tlvs: &HashMap<u16, Vec<u8>>) -> Result<(ServerAddress, Vec<u8>), OscarError> {
+    let address_bytes = tlvs.get(&0x05).ok_or(OscarError::UnexpectedResponse("missing redirect address (TLV 0x05)"))?;
+    let cookie = tlvs.get(&0x06).ok_or(OscarError::UnexpectedResponse("missing redirect cookie (TLV 0x06)"))?.clone();
+    let address_str = String::from_utf8_lossy(address_bytes).to_string();
+    let address = ServerAddress::parse(&address_str)
+        .map_err(|_| OscarError::UnexpectedResponse("server sent an unparseable redirect address"))?;
+    Ok((address, cookie))
 }
 
 pub async fn login(server: &ServerAddress, screen_name: &str, password: &str) -> Result<OscarSession, OscarError> {
-    let mut ids = RequestIdCounter(0);
+    let mut ids = RequestIdCounter::new();
     let mut auth = FlapConnection::connect(server).await?;
 
     // Channel 1 "hello": 4-byte FLAP protocol version, always 1.
@@ -256,8 +485,10 @@ pub async fn login(server: &ServerAddress, screen_name: &str, password: &str) ->
     auth.send_snac(&Snac { header, body }).await?;
 
     // Wait for the login response: either an error (TLV 0x08) or success
-    // with a BOS server address (TLV 0x05) + session cookie (TLV 0x06).
-    let (bos_address_str, cookie) = loop {
+    // with a BOS server address (TLV 0x05) + session cookie (TLV 0x06) —
+    // the same two TLVs every OServiceServiceResponse redirect carries, see
+    // `parse_redirect_address_and_cookie`.
+    let (bos_address, cookie) = loop {
         let frame = auth
             .read_frame()
             .await?
@@ -278,45 +509,18 @@ pub async fn login(server: &ServerAddress, screen_name: &str, password: &str) ->
                 return Err(OscarError::LoginFailed(format!("BUCP error code {code}")));
             }
 
-            let bos_bytes = tlvs
-                .get(&0x05)
-                .ok_or(OscarError::UnexpectedResponse("missing BOS server address (TLV 0x05)"))?;
-            let cookie = tlvs
-                .get(&0x06)
-                .ok_or(OscarError::UnexpectedResponse("missing auth cookie (TLV 0x06)"))?
-                .clone();
-            break (String::from_utf8_lossy(bos_bytes).to_string(), cookie);
+            break parse_redirect_address_and_cookie(&tlvs)?;
         }
     };
 
     // Done with the auth connection — the rest of the session happens on BOS.
     drop(auth);
 
-    let bos_address = ServerAddress::parse(&bos_address_str)
-        .map_err(|_| OscarError::UnexpectedResponse("server sent an unparseable BOS address"))?;
-    let mut bos = FlapConnection::connect(&bos_address).await?;
-
-    // Channel 1 hello again, but this time carrying the auth cookie as a TLV
-    // so the BOS server knows which just-authenticated session this is.
-    let mut hello_payload = 1u32.to_be_bytes().to_vec();
-    hello_payload.extend(Tlv::new(0x06, cookie).encode());
-    bos.send(FlapChannel::NewConnection, hello_payload).await?;
-
-    // Wait for "host online" (family Generic, subtype 0x03) — the signal
-    // that the BOS server is ready and login has fully succeeded.
-    loop {
-        let frame = bos
-            .read_frame()
-            .await?
-            .ok_or(OscarError::ConnectionClosed("waiting for host online"))?;
-        if frame.channel != FlapChannel::Data {
-            continue;
-        }
-        let Some(snac) = Snac::parse(&frame.payload) else { continue };
-        if snac.header.family == SnacFamily::Generic.as_u16() && snac.header.subtype == 0x03 {
-            break;
-        }
-    }
+    // Fresh FLAP connection, channel-1 hello carrying the auth cookie as a
+    // TLV so the BOS server knows which just-authenticated session this is,
+    // then block until "host online" — the same redirect-handoff shape
+    // ChatNav/Chat connections use later, factored out since it's identical.
+    let mut bos = connect_redirect(&bos_address, cookie).await?;
 
     // Announce "client online" (Generic family, subtype 0x02) — a list of
     // every SNAC family/version this client supports. Confirmed against
@@ -347,9 +551,11 @@ pub async fn login(server: &ServerAddress, screen_name: &str, password: &str) ->
         feedbag_items: Vec::new(),
         away_message: None,
         incoming_messages: Vec::new(),
-        ids: RequestIdCounter(0),
+        incoming_chat_invites: Vec::new(),
+        ids: RequestIdCounter::new(),
         feedbag_item_id_counter: 1,
         pending_warnings: HashMap::new(),
+        pending_service_redirect_replies: HashMap::new(),
     };
 
     // Roster is foundational session state — fetch it as soon as we're

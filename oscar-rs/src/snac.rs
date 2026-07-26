@@ -37,6 +37,8 @@ pub enum SnacFamily {
     Locate = 0x0002,        // user profile + away message get/set
     BuddyPresence = 0x0003, // "Buddy" family — online/offline arrival notifications
     Messaging = 0x0004,     // ICBM — instant messages
+    ChatNav = 0x000D,       // chat room lookup/creation (ephemeral connection)
+    Chat = 0x000E,          // chat room messaging/occupancy (one per joined room)
     Feedbag = 0x0013,       // buddy list roster storage (add/remove/sync)
     Authorization = 0x0017, // BUCP — login/auth
 }
@@ -52,6 +54,8 @@ impl SnacFamily {
             0x0002 => Some(SnacFamily::Locate),
             0x0003 => Some(SnacFamily::BuddyPresence),
             0x0004 => Some(SnacFamily::Messaging),
+            0x000D => Some(SnacFamily::ChatNav),
+            0x000E => Some(SnacFamily::Chat),
             0x0013 => Some(SnacFamily::Feedbag),
             0x0017 => Some(SnacFamily::Authorization),
             _ => None,
@@ -305,6 +309,8 @@ mod tests {
             SnacFamily::Locate,
             SnacFamily::BuddyPresence,
             SnacFamily::Messaging,
+            SnacFamily::ChatNav,
+            SnacFamily::Chat,
             SnacFamily::Feedbag,
             SnacFamily::Authorization,
         ] {

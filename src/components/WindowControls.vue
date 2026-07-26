@@ -27,6 +27,12 @@ function close(): void {
   align-items: center;
   justify-content: flex-end;
   user-select: none;
+  /* Transparent by default, this row just shows whatever's behind it — fine
+     in the hub (App.vue's dark #2b2b2b app-shell), but floating windows
+     (ImWindow/ChatWindow) sit it directly against a white shell, making the
+     light close/minimize icons invisible. Give it its own dark background
+     so it looks right regardless of which shell it's embedded in. */
+  background: #2b2b2b;
 }
 
 .ctrl-btn {

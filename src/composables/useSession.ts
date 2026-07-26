@@ -2,7 +2,7 @@ import { computed, reactive, ref, watch } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { emitTo, listen } from '@tauri-apps/api/event';
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
-import type { Buddy, GroupedBuddies, ImSeedPayload, Message, Screen, SessionSnapshot, Toast } from '../types';
+import type { Buddy, ChatInvite, GroupedBuddies, ImSeedPayload, Message, Screen, SessionSnapshot, Toast } from '../types';
 import { normalizeScreenName } from '../utils/screenName';
 import { playSound } from '../utils/sound';
 import { useNotifications } from './useNotifications';
@@ -38,6 +38,23 @@ const soundPrefs = reactive({
 // label the window was created with. Plain (not reactive) — only ever read/
 // written from functions below, nothing templated renders it directly.
 const openImWindows = new Set<string>();
+// Same idea, one entry per open chat room window, keyed by the room label
+// the backend assigned (session_actor::room_label_for).
+const openChatWindows = new Set<string>();
+
+// Invites the user has declined or already accepted, so they stop appearing
+// in `pendingInvites` even though the backend's own
+// `incoming_chat_invites` vector still has the entry (declining is a pure
+// frontend-side dismissal — see declineInvite below for why no backend call
+// exists for it, and acceptInvite for why a backend-vector *index* isn't a
+// safe identity to hold onto across renders: accepting shifts every later
+// invite's index down by one, silently mislabeling whatever was declined
+// under a now-stale index). Keyed by content instead — see inviteKey.
+const dismissedInviteKeys = new Set<string>();
+
+function inviteKey(invite: ChatInvite): string {
+  return `${normalizeScreenName(invite.from)}::${invite.room.room_cookie}`;
+}
 
 let toastSeq = 0;
 
@@ -80,6 +97,33 @@ async function openImWindow(buddyName: string): Promise<void> {
   openImWindows.add(label);
   win.once('tauri://destroyed', () => {
     openImWindows.delete(label);
+  });
+}
+
+// Opens (or focuses) a room's OS window. `label` is the opaque
+// backend-assigned room label (session_actor::room_label_for) returned by
+// create_room/accept_chat_invite — used verbatim as both the window label
+// and the room-scoped Tauri commands' `roomLabel` argument, so there's no
+// separate frontend-side label derivation to keep in sync with the backend
+// the way `labelFor` has to for IM/buddy names.
+async function openChatWindow(label: string, roomName: string): Promise<void> {
+  const existing = await WebviewWindow.getByLabel(label);
+  if (existing) {
+    await existing.setFocus();
+    return;
+  }
+
+  const win = new WebviewWindow(label, {
+    url: `/#/chat/${encodeURIComponent(label)}`,
+    title: roomName,
+    width: 380,
+    height: 520,
+    decorations: false,
+    resizable: true,
+  });
+  openChatWindows.add(label);
+  win.once('tauri://destroyed', () => {
+    openChatWindows.delete(label);
   });
 }
 
@@ -171,6 +215,21 @@ watch(snapshot, (newSnap, oldSnap) => {
       }
     }
   }
+
+  // Same append-only-growth reasoning as incoming_messages above —
+  // incoming_chat_invites only shrinks when *this* client accepts one
+  // (backend removes it by index at that point), so between any two
+  // snapshots it only ever gains entries from other people's invites.
+  const prevInviteCount = oldSnap ? oldSnap.incoming_chat_invites.length : 0;
+  if (oldSnap && newSnap.incoming_chat_invites.length > prevInviteCount) {
+    const arrivals = newSnap.incoming_chat_invites.slice(prevInviteCount);
+    for (const invite of arrivals) {
+      // Not gated by soundPrefs/toasts — an invite needs an explicit
+      // Accept/Decline, so it's surfaced via the persistent
+      // ChatInviteBanner (App.vue), not the auto-dismissing toast stream.
+      notify(invite.from, `Invited you to "${invite.room.room_name}"`);
+    }
+  }
 });
 
 listen<SessionSnapshot>('session-update', (event) => {
@@ -191,6 +250,18 @@ function resetSessionState(): void {
   infoBuddy.value = null;
   for (const key of Object.keys(messageThreads)) delete messageThreads[key];
   for (const key of Object.keys(unreadCounts)) delete unreadCounts[key];
+  dismissedInviteKeys.clear();
+
+  // Unlike an IM window (harmless, purely local state that just goes stale
+  // if left open), a chat room window's backend actor owns its own live
+  // connection independent of the main session — ending the session doesn't
+  // implicitly close it. Ask each open room window to close itself; that
+  // triggers its own onCloseRequested handler (ChatWindow.vue), which calls
+  // leave_room before actually closing, so the room's connection/actor get
+  // torn down too instead of leaking.
+  for (const label of [...openChatWindows]) {
+    WebviewWindow.getByLabel(label).then((win) => win?.close());
+  }
 }
 
 // Every backend action below reports failure as an error toast (in addition
@@ -219,6 +290,14 @@ const groupedBuddies = computed<GroupedBuddies[]>(() => {
     total: members.length,
     buddies: members,
   }));
+});
+
+// The banner-facing view of incoming_chat_invites: whatever the backend
+// still has on hand, minus whatever this client has already dismissed
+// locally (declined, or accepted and already opened).
+const pendingInvites = computed<ChatInvite[]>(() => {
+  const invites = snapshot.value?.incoming_chat_invites ?? [];
+  return invites.filter((invite) => !dismissedInviteKeys.has(inviteKey(invite)));
 });
 
 function getBuddy(screenName: string): Buddy | undefined {
@@ -258,6 +337,10 @@ function goToAway(): void {
 
 function goToPreferences(): void {
   currentScreen.value = 'preferences';
+}
+
+function goToCreateRoom(): void {
+  currentScreen.value = 'createroom';
 }
 
 async function login(server: string, screenName: string, password: string): Promise<void> {
@@ -313,6 +396,32 @@ async function toggleBlock(buddy: Buddy): Promise<void> {
   );
 }
 
+async function createRoom(roomName: string, inviteScreenNames: string[]): Promise<void> {
+  const label = await guarded(
+    () => invoke<string>('create_room', { roomName, inviteScreenNames }),
+    "Couldn't create room",
+  );
+  currentScreen.value = 'buddylist';
+  await openChatWindow(label, roomName);
+}
+
+async function acceptInvite(invite: ChatInvite): Promise<void> {
+  // Recomputed at call time rather than captured when the invite was first
+  // rendered — see dismissedInviteKeys' doc comment for why a backend-vector
+  // index can't just be captured once and reused.
+  const invites = snapshot.value?.incoming_chat_invites ?? [];
+  const index = invites.findIndex((i) => inviteKey(i) === inviteKey(invite));
+  if (index === -1) return; // already gone — e.g. dispatched twice from a double-click
+
+  dismissedInviteKeys.add(inviteKey(invite));
+  const label = await guarded(() => invoke<string>('accept_chat_invite', { index }), "Couldn't join room");
+  await openChatWindow(label, invite.room.room_name);
+}
+
+function declineInvite(invite: ChatInvite): void {
+  dismissedInviteKeys.add(inviteKey(invite));
+}
+
 export function useSession() {
   return {
     currentScreen,
@@ -326,6 +435,7 @@ export function useSession() {
     getBuddy,
     getThread,
     unreadFor,
+    pendingInvites,
 
     goToBuddyList,
     goToIm,
@@ -333,6 +443,7 @@ export function useSession() {
     backFromInfo,
     goToAway,
     goToPreferences,
+    goToCreateRoom,
 
     login,
     logout,
@@ -343,6 +454,9 @@ export function useSession() {
     requestInfo,
     warnBuddy,
     toggleBlock,
+    createRoom,
+    acceptInvite,
+    declineInvite,
 
     dismissToast,
   };

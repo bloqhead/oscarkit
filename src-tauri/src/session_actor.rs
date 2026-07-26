@@ -12,7 +12,7 @@
 use tokio::sync::{mpsc, oneshot};
 use tauri::{AppHandle, Emitter};
 
-use oscar_rs::{Buddy, FlapReader, IncomingIm, OscarSession};
+use oscar_rs::{Buddy, ChatInvite, FlapReader, IncomingIm, OscarSession};
 
 pub enum SessionCommand {
     SendMessage { recipient: String, text: String, reply: oneshot::Sender<Result<(), String>> },
@@ -23,6 +23,15 @@ pub enum SessionCommand {
     SendWarning { screen_name: String, anonymous: bool, reply: oneshot::Sender<Result<(), String>> },
     AddToBlockList { screen_name: String, reply: oneshot::Sender<Result<(), String>> },
     RemoveFromBlockList { screen_name: String, reply: oneshot::Sender<Result<(), String>> },
+    /// Creates a room, joins it, spawns its `chat_actor`, then best-effort
+    /// invites each requested screen name (a failed invite to one recipient
+    /// doesn't fail the whole creation — logged and skipped). Replies with
+    /// the new room's label so the caller can open its window.
+    CreateChatRoom { room_name: String, invite_screen_names: Vec<String>, reply: oneshot::Sender<Result<String, String>> },
+    /// Joins the room named by an already-received invite (by its index into
+    /// `incoming_chat_invites`) and spawns its `chat_actor`. Declining an
+    /// invite needs no command at all — it's a pure frontend-side dismissal.
+    AcceptChatInvite { index: usize, reply: oneshot::Sender<Result<String, String>> },
 }
 
 /// A plain-data snapshot of the session state the frontend cares about —
@@ -34,6 +43,7 @@ pub struct SessionSnapshot {
     pub buddies: Vec<Buddy>,
     pub incoming_messages: Vec<IncomingIm>,
     pub away_message: Option<String>,
+    pub incoming_chat_invites: Vec<ChatInvite>,
 }
 
 impl From<&OscarSession> for SessionSnapshot {
@@ -43,17 +53,33 @@ impl From<&OscarSession> for SessionSnapshot {
             buddies: session.buddies.clone(),
             incoming_messages: session.incoming_messages.clone(),
             away_message: session.away_message.clone(),
+            incoming_chat_invites: session.incoming_chat_invites.clone(),
         }
     }
 }
 
-enum FrameEvent {
+pub(crate) enum FrameEvent {
     Frame(oscar_rs::FlapFrame),
     Closed,
     Error(std::io::Error),
 }
 
-async fn run_reader(mut reader: FlapReader, tx: mpsc::Sender<FrameEvent>) {
+/// Turns a room cookie (`"{exchange}-{instance}-{name}"`, e.g.
+/// `"4-0-MyRoom"`) into a string safe to use as both a Tauri window label
+/// and a `ChatRoomsState` key — the raw cookie embeds the room name
+/// verbatim, which can contain spaces or other characters window labels
+/// don't allow. Deterministic per cookie (not a hash) so the same room
+/// always maps to the same label within a run, mirroring how
+/// `normalizeScreenName` derives IM window labels from buddy names.
+pub(crate) fn room_label_for(room_cookie: &str) -> String {
+    let sanitized: String = room_cookie
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c.to_ascii_lowercase() } else { '_' })
+        .collect();
+    format!("chat-{sanitized}")
+}
+
+pub(crate) async fn run_reader(mut reader: FlapReader, tx: mpsc::Sender<FrameEvent>) {
     loop {
         match reader.read_frame().await {
             Ok(Some(frame)) => {
@@ -86,7 +112,7 @@ pub fn spawn(app: AppHandle, mut session: OscarSession) -> mpsc::Sender<SessionC
             tokio::select! {
                 cmd = cmd_rx.recv() => {
                     match cmd {
-                        Some(command) => handle_command(&mut session, command).await,
+                        Some(command) => handle_command(&app, &mut session, command, &mut frame_rx).await,
                         None => break, // frontend/app side dropped the sender — nothing left to serve
                     }
                 }
@@ -117,7 +143,27 @@ pub fn spawn(app: AppHandle, mut session: OscarSession) -> mpsc::Sender<SessionC
     cmd_tx
 }
 
-async fn handle_command(session: &mut OscarSession, command: SessionCommand) {
+/// Feeds `request_service_redirect` (called transitively by
+/// `create_and_join_room`/`join_room`) frames straight off the actor's own
+/// `frame_rx` — the reader task already forwards every BOS frame there, so
+/// this is the "answer" `FrameSource`'s doc comment refers to for real Tauri
+/// usage, once `split_reader()` has already handed the actual `FlapReader`
+/// off to `run_reader`.
+struct ActorFrameSource<'a> {
+    rx: &'a mut mpsc::Receiver<FrameEvent>,
+}
+
+impl<'a> oscar_rs::FrameSource for ActorFrameSource<'a> {
+    async fn next_frame(&mut self) -> Result<oscar_rs::FlapFrame, oscar_rs::OscarError> {
+        match self.rx.recv().await {
+            Some(FrameEvent::Frame(frame)) => Ok(frame),
+            Some(FrameEvent::Closed) | None => Err(oscar_rs::OscarError::ConnectionClosed("bos session")),
+            Some(FrameEvent::Error(e)) => Err(oscar_rs::OscarError::Io(e)),
+        }
+    }
+}
+
+async fn handle_command(app: &AppHandle, session: &mut OscarSession, command: SessionCommand, frame_rx: &mut mpsc::Receiver<FrameEvent>) {
     match command {
         SessionCommand::SendMessage { recipient, text, reply } => {
             let _ = reply.send(session.send_message(&recipient, &text).await.map_err(|e| e.to_string()));
@@ -142,6 +188,44 @@ async fn handle_command(session: &mut OscarSession, command: SessionCommand) {
         }
         SessionCommand::RemoveFromBlockList { screen_name, reply } => {
             let _ = reply.send(session.remove_from_block_list(&screen_name).await.map_err(|e| e.to_string()));
+        }
+        SessionCommand::CreateChatRoom { room_name, invite_screen_names, reply } => {
+            let mut frames = ActorFrameSource { rx: frame_rx };
+            match session.create_and_join_room(&room_name, &mut frames).await {
+                Ok(room) => {
+                    let label = room_label_for(&room.handle.room_cookie);
+                    let handle = room.handle.clone();
+                    crate::chat_actor::spawn(app.clone(), room, label.clone());
+                    for screen_name in &invite_screen_names {
+                        let invitation_text = format!("Join {}", handle.room_name);
+                        if let Err(e) = session.send_chat_invite(screen_name, &handle, &invitation_text).await {
+                            eprintln!("[oscarkit] failed to invite {screen_name} to room {}: {e}", handle.room_name);
+                        }
+                    }
+                    let _ = reply.send(Ok(label));
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(e.to_string()));
+                }
+            }
+        }
+        SessionCommand::AcceptChatInvite { index, reply } => {
+            let Some(invite) = session.incoming_chat_invites.get(index).cloned() else {
+                let _ = reply.send(Err("invite no longer available".to_string()));
+                return;
+            };
+            session.incoming_chat_invites.remove(index);
+            let mut frames = ActorFrameSource { rx: frame_rx };
+            match session.join_room(&invite.room, &mut frames).await {
+                Ok(room) => {
+                    let label = room_label_for(&room.handle.room_cookie);
+                    crate::chat_actor::spawn(app.clone(), room, label.clone());
+                    let _ = reply.send(Ok(label));
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(e.to_string()));
+                }
+            }
         }
     }
 }

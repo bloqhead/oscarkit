@@ -10,8 +10,19 @@ import BlockedBadge from '../components/BlockedBadge.vue';
 import UnreadBadge from '../components/UnreadBadge.vue';
 import ToastContainer from '../components/ToastContainer.vue';
 
-const { snapshot, groupedBuddies, unreadFor, goToIm, goToInfo, goToAway, goToPreferences, clearAway, logout, addBuddy } =
-  useSession();
+const {
+  snapshot,
+  groupedBuddies,
+  unreadFor,
+  goToIm,
+  goToInfo,
+  goToAway,
+  goToPreferences,
+  goToCreateRoom,
+  clearAway,
+  logout,
+  addBuddy,
+} = useSession();
 
 async function handleImBack(): Promise<void> {
   await clearAway();
@@ -48,6 +59,7 @@ async function handleAddBuddy(): Promise<void> {
 
     <div class="action-row">
       <button class="btn-secondary" @click="goToAway">Away</button>
+      <button class="btn-secondary" @click="goToCreateRoom">Create Room</button>
       <button class="btn-secondary" @click="goToPreferences">Setup</button>
       <button class="btn-secondary" @click="handleSignOff">Sign Off</button>
     </div>
@@ -115,7 +127,8 @@ async function handleAddBuddy(): Promise<void> {
 
 .action-row {
   display: flex;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 6px;
   padding: 8px 12px;
   border-bottom: 1px solid #ddd;
 }

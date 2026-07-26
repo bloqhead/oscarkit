@@ -17,18 +17,56 @@ export interface IncomingIm {
   text: string;
 }
 
+// Mirrors oscar-rs/src/chat_nav.rs::ChatRoomHandle.
+export interface ChatRoomHandle {
+  exchange: number;
+  room_cookie: string;
+  instance: number;
+  room_name: string;
+}
+
+// Mirrors oscar-rs/src/messaging.rs::ChatInvite.
+export interface ChatInvite {
+  from: string;
+  invitation_text: string;
+  room: ChatRoomHandle;
+}
+
+// Mirrors oscar-rs/src/chat.rs::ChatOccupant.
+export interface ChatOccupant {
+  screen_name: string;
+  warning_level: number;
+}
+
+// Mirrors oscar-rs/src/chat.rs::ChatMessage.
+export interface ChatMessageWire {
+  from: string;
+  text: string;
+}
+
+// Mirrors src-tauri/src/chat_actor.rs::ChatRoomSnapshot.
+export interface ChatRoomSnapshot {
+  room_name: string;
+  occupants: ChatOccupant[];
+  messages: ChatMessageWire[];
+  my_screen_name: string;
+  closed: boolean;
+}
+
 export interface SessionSnapshot {
   screen_name: string;
   buddies: Buddy[];
   incoming_messages: IncomingIm[];
   away_message: string | null;
+  incoming_chat_invites: ChatInvite[];
 }
 
 // Frontend-only types below — no backend equivalent.
 
-// 'im' isn't a hub screen — each conversation is its own OS window
-// (src/screens/ImWindow.vue), not a state inside this switch.
-export type Screen = 'signon' | 'buddylist' | 'info' | 'away' | 'preferences';
+// Neither 'im' nor 'chat' is a hub screen — each conversation/room is its
+// own OS window (src/screens/ImWindow.vue, ChatWindow.vue), not a state
+// inside this switch.
+export type Screen = 'signon' | 'buddylist' | 'info' | 'away' | 'preferences' | 'createroom';
 
 export interface Message {
   from: string;

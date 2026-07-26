@@ -7,11 +7,13 @@ import { useUpdater } from './composables/useUpdater';
 import { useNotifications } from './composables/useNotifications';
 import WindowControls from './components/WindowControls.vue';
 import UpdateBanner from './components/UpdateBanner.vue';
+import ChatInviteBanner from './components/ChatInviteBanner.vue';
 import SignOnScreen from './screens/SignOnScreen.vue';
 import BuddyListScreen from './screens/BuddyListScreen.vue';
 import BuddyInfoScreen from './screens/BuddyInfoScreen.vue';
 import AwayMessageScreen from './screens/AwayMessageScreen.vue';
 import PreferencesScreen from './screens/PreferencesScreen.vue';
+import CreateRoomScreen from './screens/CreateRoomScreen.vue';
 
 const { currentScreen } = useSession();
 const { checkForUpdate } = useUpdater();
@@ -43,12 +45,14 @@ onMounted(() => {
     <div class="frame-wrap">
       <div class="phone-frame">
         <UpdateBanner />
+        <ChatInviteBanner v-if="currentScreen !== 'signon'" />
         <div class="screen-wrap">
           <SignOnScreen v-if="currentScreen === 'signon'" />
           <BuddyListScreen v-else-if="currentScreen === 'buddylist'" />
           <BuddyInfoScreen v-else-if="currentScreen === 'info'" />
           <AwayMessageScreen v-else-if="currentScreen === 'away'" />
           <PreferencesScreen v-else-if="currentScreen === 'preferences'" />
+          <CreateRoomScreen v-else-if="currentScreen === 'createroom'" />
         </div>
       </div>
     </div>

@@ -1,10 +1,12 @@
+mod chat_actor;
 mod commands;
 mod credentials;
 mod session_actor;
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
-use commands::SessionState;
+use commands::{ChatRoomsState, SessionState};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -23,6 +25,7 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .manage(SessionState(Mutex::new(None)))
+        .manage(ChatRoomsState(Mutex::new(HashMap::new())))
         .invoke_handler(tauri::generate_handler![
             commands::login,
             commands::send_message,
@@ -34,6 +37,11 @@ pub fn run() {
             commands::add_to_block_list,
             commands::remove_from_block_list,
             commands::logout,
+            commands::create_room,
+            commands::accept_chat_invite,
+            commands::send_chat_message,
+            commands::get_chat_snapshot,
+            commands::leave_room,
             credentials::save_password,
             credentials::get_saved_password,
             credentials::delete_saved_password,
